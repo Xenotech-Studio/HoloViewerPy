@@ -205,9 +205,9 @@ class HoloViewer(ABC):
     def __init__(
         self,
         window_name: str,
-        width: int,
-        height: int,
-        fov_y_deg: float,
+        width: int = 800,
+        height: int = 600,
+        fov_y_deg: float = 50.0,
         axis_mode: str = "Z_UP",
         canonical_initial: Optional[np.ndarray] = None,
         axis_initial_overrides: Optional[Dict[str, np.ndarray]] = None,
@@ -433,6 +433,10 @@ class HoloViewer(ABC):
                         self.play_rate = min(64.0, self.play_rate * 2.0)
                     if key == ord("-") or key == ord("_"):
                         self.play_rate = max(0.001, self.play_rate * 0.5)
+                    if key == ord("9"):
+                        self.fov_y_deg = max(5.0, min(120.0, self.fov_y_deg * 0.9))
+                    if key == ord("0"):
+                        self.fov_y_deg = max(5.0, min(120.0, self.fov_y_deg * 1.1))
                     if key == ord("["):
                         self.adjust_time(-self.time_step)
                     if key == ord("]"):
@@ -455,6 +459,14 @@ class HoloViewer(ABC):
                     move, forward, right, up, world_up
                 )
                 pos += move
+
+                # Update width/height from actual window size (e.g. after user resize).
+                try:
+                    _x, _y, w, h = cv2.getWindowImageRect(self.window_name)
+                    if w > 0 and h > 0:
+                        self.width, self.height = w, h
+                except Exception:
+                    pass
 
                 (
                     view,
@@ -629,7 +641,6 @@ class HoloViewer(ABC):
     def load_assets(self) -> None:
         ...
 
-    @abstractmethod
     def build_camera(
         self,
         view: np.ndarray,
@@ -640,14 +651,22 @@ class HoloViewer(ABC):
         zfar: float,
         sim_time: float,
     ) -> Tuple[object, torch.Tensor]:
-        ...
+        """Default: return (cam_dict, full_tensor) with view/proj/full/width/height. Override if you need custom cam data for render_frame or axes."""
+        full = (proj @ view).astype(np.float32)
+        cam = {"view": view, "proj": proj, "full": full, "width": self.width, "height": self.height}
+        return cam, torch.from_numpy(full)
 
     @abstractmethod
     def render_frame(self, cam: object, sim_time: float) -> torch.Tensor:
         ...
 
-    @abstractmethod
     def project_points_ndc(
         self, points_ws: np.ndarray, full: torch.Tensor
     ) -> np.ndarray:
-        ...
+        """World-space points to NDC (e.g. for axes/overlays). Override if you need a different NDC convention."""
+        fn = full.cpu().numpy()
+        n = points_ws.shape[0]
+        pts = np.hstack([np.asarray(points_ws, dtype=np.float64), np.ones((n, 1))])
+        clip = pts @ fn.T
+        w = np.where(np.abs(clip[:, 3]) < 1e-8, 1e-8, clip[:, 3])
+        return (clip[:, :3] / w.reshape(-1, 1)).astype(np.float32)

@@ -17,6 +17,20 @@ pip install -e .
 pip install -e Utils/HoloViewerPy
 ```
 
+## 示例
+
+用 PyVista（VTK）渲染一个立方体，支持多 GPU 后端（macOS Metal、Linux Vulkan、Windows DX12 等）：
+
+```bash
+cd packages/HoloViewerPy
+pip install -e ".[sample]"   # 或 pip install -e . && pip install pyvista
+python sample.py
+```
+
+- **WASD** 移动，**空格/Shift/Alt** 上下，**鼠标左键或右键拖拽** 旋转视角，**中键** 平移
+- **Q/E** 上一帧/下一帧，**Tab** 播放/暂停，**`** 切换坐标轴，**Ctrl+左键点击** 切换锁定
+- Windows 与 macOS 交互一致（macOS 通过 Quartz 支持按键按住连续移动）
+
 ## 使用方法
 
 安装后，可以直接导入使用：
