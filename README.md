@@ -1,4 +1,4 @@
-# XenoViewer
+# HoloViewer
 
 一个用于构建交互式 3D 查看器的基类库，基于 OpenCV。
 
@@ -7,14 +7,14 @@
 使用可编辑模式安装（推荐用于开发）：
 
 ```bash
-cd Utils/XenoViewerPy
+cd Utils/HoloViewerPy
 pip install -e .
 ```
 
 或者从项目根目录安装：
 
 ```bash
-pip install -e Utils/XenoViewerPy
+pip install -e Utils/HoloViewerPy
 ```
 
 ## 使用方法
@@ -22,11 +22,11 @@ pip install -e Utils/XenoViewerPy
 安装后，可以直接导入使用：
 
 ```python
-from xenoviewer import XenoViewer, wrap_time, to_uint8_bgr
+from holoviewer import HoloViewer, wrap_time, to_uint8_bgr
 import numpy as np
 import torch
 
-class MyViewer(XenoViewer):
+class MyViewer(HoloViewer):
     def load_assets(self):
         # 加载你的资源
         pass

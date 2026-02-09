@@ -1,5 +1,5 @@
 [project]
-name = "xenoviewer"
+name = "holoviewer"
 version = "0.1.0"
 description = "A base class for building interactive 3D viewers with OpenCV"
 readme = "README.md"
@@ -22,5 +22,5 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["xenoviewer"]
-package-dir = {"xenoviewer" = "."}
+packages = ["holoviewer"]
+package-dir = {"holoviewer" = "."}

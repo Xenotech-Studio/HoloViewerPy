@@ -1,12 +1,12 @@
-"""Setup script for XenoViewer package."""
+"""Setup script for HoloViewer package."""
 from setuptools import setup
 
 setup(
-    name="xenoviewer",
+    name="holoviewer",
     version="0.1.0",
     description="A base class for building interactive 3D viewers with OpenCV",
-    packages=["xenoviewer"],
-    package_dir={"xenoviewer": "."},
+    packages=["holoviewer"],
+    package_dir={"holoviewer": "."},
     install_requires=[
         "numpy",
         "torch",

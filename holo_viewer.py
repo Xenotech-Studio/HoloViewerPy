@@ -148,7 +148,7 @@ def to_uint8_bgr(image_tensor: torch.Tensor) -> np.ndarray:
     return img[:, :, ::-1]
 
 
-class XenoViewer(ABC):
+class HoloViewer(ABC):
     def __init__(
         self,
         window_name: str,
@@ -575,4 +575,3 @@ class XenoViewer(ABC):
         self, points_ws: np.ndarray, full: torch.Tensor
     ) -> np.ndarray:
         ...
-

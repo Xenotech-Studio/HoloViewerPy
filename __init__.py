@@ -1,13 +1,13 @@
 """
-XenoViewer - A base class for building interactive 3D viewers with OpenCV.
+HoloViewer - A base class for building interactive 3D viewers with OpenCV.
 
-This package provides XenoViewer, an abstract base class that developers can inherit
+This package provides HoloViewer, an abstract base class that developers can inherit
 to create their own interactive 3D viewers. It handles window management, camera controls,
 input handling, and time playback, while allowing subclasses to implement custom rendering logic.
 """
 
-from .xeno_viewer import (
-    XenoViewer,
+from .holo_viewer import (
+    HoloViewer,
     AxisSystem,
     AxisConfig,
     wrap_time,
@@ -28,12 +28,12 @@ from .xeno_viewer import (
 )
 
 try:
-    from .xeno_viewer import cv2
+    from .holo_viewer import cv2
 except ImportError:
     cv2 = None
 
 __all__ = [
-    "XenoViewer",
+    "HoloViewer",
     "AxisSystem",
     "AxisConfig",
     "wrap_time",
@@ -55,4 +55,3 @@ __all__ = [
 ]
 
 __version__ = "0.1.0"
-
