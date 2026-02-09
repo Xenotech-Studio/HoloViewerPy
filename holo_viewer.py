@@ -1,8 +1,9 @@
 import math
 import os
+import sys
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
@@ -11,7 +12,6 @@ try:
     import cv2  # type: ignore
 except Exception:  # pragma: no cover
     cv2 = None
-
 
 _VK_SHIFT = 0x10
 _VK_CONTROL = 0x11
@@ -33,6 +33,58 @@ if os.name == "nt":  # pragma: no cover - platform specific
         _win_key = ctypes.windll.user32  # type: ignore[attr-defined]
     except Exception:  # pragma: no cover
         _win_key = None
+
+# macOS: 使用 Quartz 查询按键状态，实现与 Windows GetAsyncKeyState 类似的“按住连续移动”
+_mac_key: Optional[Callable[[int], bool]] = None
+if sys.platform == "darwin":  # pragma: no cover - platform specific
+    try:
+        import ctypes as _ctypes
+        from ctypes import util as _ctypes_util
+
+        _cg = _ctypes.CDLL(_ctypes_util.find_library("CoreGraphics"))
+        # CGEventSourceKeyState(CGEventSourceStateID state, CGKeyCode key) -> Boolean
+        _cg.CGEventSourceKeyState.argtypes = [_ctypes.c_uint32, _ctypes.c_uint16]
+        _cg.CGEventSourceKeyState.restype = _ctypes.c_uint8
+        # kCGEventSourceStateCombinedSessionState = 0
+        _kCGEventSourceStateCombinedSessionState = 0
+        # Carbon Events.h 物理键码 (ANSI)
+        _kVK_ANSI_W = 0x0D
+        _kVK_ANSI_A = 0x00
+        _kVK_ANSI_S = 0x01
+        _kVK_ANSI_D = 0x02
+        _kVK_ANSI_Q = 0x0C
+        _kVK_ANSI_E = 0x0E
+        _kVK_Space = 0x31
+        _kVK_Tab = 0x30
+        _kVK_ANSI_Grave = 0x32
+        _kVK_Shift = 0x38
+        _kVK_Option = 0x3A
+
+        def _mac_key_state(vk: int) -> bool:
+            return bool(_cg.CGEventSourceKeyState(_kCGEventSourceStateCombinedSessionState, vk))
+
+        _mac_key_map = {
+            "w": _kVK_ANSI_W,
+            "a": _kVK_ANSI_A,
+            "s": _kVK_ANSI_S,
+            "d": _kVK_ANSI_D,
+            "q": _kVK_ANSI_Q,
+            "e": _kVK_ANSI_E,
+            "space": _kVK_Space,
+            "tab": _kVK_Tab,
+            "grave": _kVK_ANSI_Grave,
+            "shift": _kVK_Shift,
+            "option": _kVK_Option,
+        }
+
+        def _mac_key(vk_name: str) -> bool:
+            if vk_name not in _mac_key_map:
+                return False
+            return _mac_key_state(_mac_key_map[vk_name])
+
+        _mac_key = _mac_key
+    except Exception:  # pragma: no cover
+        _mac_key = None
 
 
 class AxisConfig(NamedTuple):
@@ -120,6 +172,7 @@ class AxisSystem:
         return forward, right, up
 
     def look_dir_to_angles(self, look_dir: np.ndarray) -> Tuple[float, float]:
+        """将视线方向 look_dir 转为 (yaw, pitch)。"""
         dir_c = self.world_to_canonical(look_dir)
         dir_c = dir_c / (np.linalg.norm(dir_c) + 1e-9)
         yaw = math.atan2(float(dir_c[1]), float(dir_c[0]))
@@ -196,6 +249,9 @@ class HoloViewer(ABC):
         self._prev_e = False
         self._show_axes_flag = show_axes
         self._locked = False
+        # 左键拖拽 = 旋转（与右键一致）；Ctrl+左键点击 = 锁定
+        self._left_dragging = False
+        self._ctrl_click_pos: Optional[Tuple[int, int]] = None
 
     def run(self) -> None:
         self.load_assets()
@@ -214,27 +270,33 @@ class HoloViewer(ABC):
 
         def on_mouse(event, x, y, flags, param):
             nonlocal pos, yaw, pitch
-            # 检测 Control + 鼠标左键点击来切换锁定状态
             ctrl_pressed = False
             if _win_key is not None:
-                # Windows 上使用 GetAsyncKeyState 检测 Control 键
                 ctrl_pressed = bool(_win_key.GetAsyncKeyState(_VK_CONTROL) & 0x8000)
             else:
-                # 其他平台使用 OpenCV 的 flags
                 ctrl_pressed = bool(flags & cv2.EVENT_FLAG_CTRLKEY)
-            
-            if event == cv2.EVENT_LBUTTONDOWN and ctrl_pressed:
-                self._locked = not self._locked
-                # 解锁时重置拖拽状态
-                if not self._locked:
-                    self._dragging = False
-                    self._pan_dragging = False
+
+            # 左键按下：与 Windows 一致，左键拖拽 = 旋转；若带 Ctrl 且未拖拽则松开时切换锁定
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self._left_dragging = True
+                self._last_mouse = (x, y)
+                self._ctrl_click_pos = (x, y) if ctrl_pressed else None
                 return
-            
-            # 如果视口已锁定，不响应任何鼠标交互
+            if event == cv2.EVENT_LBUTTONUP and self._left_dragging:
+                if self._ctrl_click_pos is not None:
+                    cx, cy = self._ctrl_click_pos
+                    if (x - cx) ** 2 + (y - cy) ** 2 < 25:
+                        self._locked = not self._locked
+                        if not self._locked:
+                            self._dragging = False
+                            self._pan_dragging = False
+                self._left_dragging = False
+                self._ctrl_click_pos = None
+                return
+
             if self._locked:
                 return
-            
+
             if event == cv2.EVENT_RBUTTONDOWN:
                 self._dragging = True
                 self._last_mouse = (x, y)
@@ -249,7 +311,8 @@ class HoloViewer(ABC):
                 dx = x - self._last_mouse[0]
                 dy = y - self._last_mouse[1]
                 self._last_mouse = (x, y)
-                if self._dragging:
+                # 右键或左键拖拽 = 旋转视角（与 Windows 设计一致）
+                if self._dragging or self._left_dragging:
                     yaw, pitch = self._update_yaw_pitch(yaw, pitch, dx, dy)
                 elif self._pan_dragging:
                     _, right_vec, up_vec = self.axis_system.compute_camera_axes(
@@ -311,13 +374,25 @@ class HoloViewer(ABC):
                     alt_down = bool(_win_key.GetAsyncKeyState(_VK_MENU) & 0x8000)
                     tab_down = bool(_win_key.GetAsyncKeyState(_VK_TAB) & 0x8000)
                     oem3_down = bool(_win_key.GetAsyncKeyState(_VK_OEM3) & 0x8000)
+                elif _mac_key is not None:
+                    w_down = _mac_key("w")
+                    a_down = _mac_key("a")
+                    s_down = _mac_key("s")
+                    d_down = _mac_key("d")
+                    q_down = _mac_key("q")
+                    e_down = _mac_key("e")
+                    space_down = _mac_key("space")
+                    shift_down = _mac_key("shift")
+                    alt_down = _mac_key("option")
+                    tab_down = _mac_key("tab")
+                    oem3_down = _mac_key("grave")
                 else:
                     q_down = key == ord("q") or key == ord("Q")
                     e_down = key == ord("e") or key == ord("E")
 
                 # 如果视口已锁定，禁用大多数键盘移动和交互（但保留帧切换）
                 if not self._locked:
-                    if _win_key is not None:
+                    if _win_key is not None or _mac_key is not None:
                         if w_down:
                             move -= forward * speed
                         if s_down:
@@ -363,7 +438,7 @@ class HoloViewer(ABC):
                     if key == ord("]"):
                         self.adjust_time(self.time_step)
 
-                if _win_key is not None:
+                if _win_key is not None or _mac_key is not None:
                     if q_down and not self._prev_q:
                         self.adjust_time(-self.time_step)
                     if e_down and not self._prev_e:
@@ -527,6 +602,7 @@ class HoloViewer(ABC):
         return True, c0, c1
 
     def get_initial_pose(self) -> Tuple[np.ndarray, np.ndarray]:
+        """返回 (相机位置, 视线方向 forward_dir)，单位向量，默认朝向原点。"""
         pos = self.axis_system.initial_position()
         forward_dir = -pos / (np.linalg.norm(pos) + 1e-9)
         return pos.astype(np.float32), forward_dir.astype(np.float32)
