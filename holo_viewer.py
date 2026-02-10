@@ -248,20 +248,21 @@ def to_uint8_bgr(image_tensor: torch.Tensor) -> np.ndarray:
     return img[:, :, ::-1]
 
 
-def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str]]:
-    """Parse --expose-port、--scribe、--subscribe from argv. Returns (expose_port, scribe_addr)."""
+def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool]:
+    """Parse --expose-port、--scribe、--subscribe、--headless from argv. Returns (expose_port, scribe_addr, headless)."""
     if argv is None:
         argv = sys.argv[1:]
     parser = argparse.ArgumentParser()
     parser.add_argument("--expose-port", type=int, default=None, metavar="PORT", help="Start WebSocket+WebRTC server on PORT for streaming")
     parser.add_argument("--scribe", type=str, default=None, metavar="HOST:PORT", help="Connect to remote HOST:PORT and display WebRTC stream (no local render)")
     parser.add_argument("--subscribe", type=str, default=None, metavar="HOST:PORT or PORT", help="Same as --scribe; if only PORT is given, use 127.0.0.1:PORT. When set, local render is never used.")
+    parser.add_argument("--headless", action="store_true", help="No cv2 window; use with --expose-port to run server and render pipeline only.")
     args, _ = parser.parse_known_args(argv)
     expose_port = args.expose_port
     scribe_addr = args.scribe or args.subscribe
     if scribe_addr and ":" not in scribe_addr:
         scribe_addr = "127.0.0.1:" + scribe_addr
-    return expose_port, scribe_addr
+    return expose_port, scribe_addr, getattr(args, "headless", False)
 
 
 def _draw_error_image(width: int, height: int, message: str, addr: str = "") -> np.ndarray:
@@ -634,24 +635,26 @@ class HoloViewer(ABC):
         self._expose_port = expose_port
         self._scribe_addr = scribe_addr
 
-    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str]]:
-        """Return (expose_port, scribe_addr). If not set in __init__, parse from sys.argv."""
+    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str], bool]:
+        """Return (expose_port, scribe_addr, headless). If not set in __init__, parse from sys.argv."""
         expose = self._expose_port
         scribe = self._scribe_addr
         if expose is None and scribe is None:
-            expose, scribe = parse_network_args()
-        return expose, scribe
+            expose, scribe, headless = parse_network_args()
+        else:
+            _, _, headless = parse_network_args()
+        return expose, scribe, headless
 
     def run(self) -> None:
         _ensure_console_logging()
-        expose_port, scribe_addr = self._get_network_mode()
+        expose_port, scribe_addr, headless = self._get_network_mode()
         if scribe_addr:
             logger.info("Subscribe mode: connecting to %s (no local render)", scribe_addr)
             self._run_scribe(scribe_addr)
             return
         if expose_port is not None:
-            logger.info("Expose mode: WebSocket+WebRTC server on port %s", expose_port)
-            self._run_expose(expose_port)
+            logger.info("Expose mode: WebSocket+WebRTC server on port %s%s", expose_port, " (headless)" if headless else "")
+            self._run_expose(expose_port, headless=headless)
             return
         logger.info("Local mode: running render pipeline")
         self._run_local()
@@ -789,8 +792,8 @@ class HoloViewer(ABC):
             stop_ev.set()
             cv2.destroyAllWindows()
 
-    def _run_expose(self, port: int) -> None:
-        """本地渲染（主线程，macOS 上 OpenCV 窗口必须主线程）+ WebSocket 服务（子线程）。主循环每帧 sleep 一小段以让出 CPU 给服务端完成握手。"""
+    def _run_expose(self, port: int, headless: bool = False) -> None:
+        """本地渲染（主线程）+ WebSocket 服务（子线程）。headless 时不创建 cv2 窗口，仅跑渲染与推流。"""
         if not _STREAM_AVAILABLE:
             raise RuntimeError("Expose mode requires: pip install holoviewer[stream] (websockets, aiortc, av)")
         frame_queue: "Queue[Tuple[np.ndarray, float]]" = Queue(maxsize=2)
@@ -802,15 +805,87 @@ class HoloViewer(ABC):
             daemon=True,
         )
         server_thread.start()
-        logger.info("WebSocket server thread started (port=%s); main thread running render loop", port)
+        logger.info("WebSocket server thread started (port=%s); main thread running %s", port, "headless render loop" if headless else "render loop")
         try:
-            self._run_local(
-                frame_queue_for_stream=frame_queue,
-                yield_to_ws_thread=True,
-                camera_command_queue=camera_command_queue,
-            )
+            if headless:
+                import signal
+                signal.signal(signal.SIGINT, lambda *a: stop_ev.set())
+                self._run_local_headless(
+                    frame_queue_for_stream=frame_queue,
+                    camera_command_queue=camera_command_queue,
+                    stop_ev=stop_ev,
+                )
+            else:
+                self._run_local(
+                    frame_queue_for_stream=frame_queue,
+                    yield_to_ws_thread=True,
+                    camera_command_queue=camera_command_queue,
+                )
         finally:
             stop_ev.set()
+
+    def _run_local_headless(
+        self,
+        frame_queue_for_stream: "Queue[Tuple[np.ndarray, float]]",
+        camera_command_queue: "Queue[Tuple[np.ndarray, float, float]]",
+        stop_ev: threading.Event,
+    ) -> None:
+        """无窗口渲染循环：仅跑渲染管线并向 frame_queue 推帧，相机由 camera_command_queue 驱动（订阅端控制）；无 cv2。"""
+        self.load_assets()
+        pos, initial_forward = self.get_initial_pose()
+        pos = pos.astype(np.float64)
+        initial_forward = initial_forward.astype(np.float64)
+        if np.linalg.norm(initial_forward) <= 1e-9:
+            initial_forward = -pos / (np.linalg.norm(pos) + 1e-9)
+        initial_forward = initial_forward / (np.linalg.norm(initial_forward) + 1e-9)
+        yaw, pitch = self.axis_system.look_dir_to_angles(initial_forward)
+        last = time.time()
+        self._show_axes_flag = self.show_axes
+        self.playing = True
+        try:
+            while not stop_ev.is_set():
+                remote_cam: Optional[Tuple[np.ndarray, float, float]] = None
+                try:
+                    while True:
+                        remote_cam = camera_command_queue.get_nowait()
+                except Empty:
+                    pass
+                if remote_cam is not None:
+                    pos, yaw, pitch = remote_cam[0].astype(np.float64).copy(), remote_cam[1], remote_cam[2]
+                forward, right, up = self.axis_system.compute_camera_axes(yaw, pitch)
+                now = time.time()
+                dt = now - last
+                last = now
+                if self.playing:
+                    time_delta = self._compute_time_delta(dt)
+                    self.sim_time = wrap_time(
+                        self.sim_time + time_delta, self.time_min, self.time_max
+                    )
+                (
+                    view,
+                    proj,
+                    fov_x,
+                    fov_y_rad,
+                    znear,
+                    zfar,
+                ) = self._build_fps_camera(pos, forward, right, up)
+                cam, full = self.build_camera(
+                    view, proj, fov_x, fov_y_rad, znear, zfar, self.sim_time
+                )
+                image_tensor = self.render_frame(cam, self.sim_time)
+                if image_tensor.shape[0] > 3:
+                    image_tensor = image_tensor[:3]
+                img_bgr = to_uint8_bgr(image_tensor)
+                img_bgr = np.ascontiguousarray(img_bgr)
+                if self._show_axes_flag:
+                    self.draw_world_axes(img_bgr, full)
+                try:
+                    frame_queue_for_stream.put_nowait((img_bgr.copy(), self.sim_time))
+                except Exception:
+                    pass
+                time.sleep(0.001)
+        except Exception:
+            logger.exception("Headless render loop error")
 
     def _run_local(
         self,
