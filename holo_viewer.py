@@ -265,6 +265,12 @@ def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int],
     return expose_port, scribe_addr, getattr(args, "headless", False)
 
 
+def is_client(argv: Optional[List[str]] = None) -> bool:
+    """True 表示当前为订阅端（--scribe/--subscribe），仅收流不渲染，可据此延迟导入仅服务端需要的包。"""
+    _, scribe_addr, _ = parse_network_args(argv)
+    return scribe_addr is not None
+
+
 def _draw_error_image(width: int, height: int, message: str, addr: str = "") -> np.ndarray:
     """在灰色背景上绘制错误/状态信息，用于订阅端连接失败或断开时在窗口内显示。"""
     if cv2 is None:
