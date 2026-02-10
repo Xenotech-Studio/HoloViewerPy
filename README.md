@@ -31,6 +31,21 @@ python sample.py
 - **Q/E** 上一帧/下一帧，**Tab** 播放/暂停，**`** 切换坐标轴，**Ctrl+左键点击** 切换锁定
 - Windows 与 macOS 交互一致（macOS 通过 Quartz 支持按键按住连续移动）
 
+### 网络推流 / 拉流（可选）
+
+安装流扩展后，子类无需改代码即可通过命令行切换模式：
+
+```bash
+pip install -e ".[sample,stream]"   # stream 含 websockets, aiortc, av
+# 本地渲染并开启 WebSocket+WebRTC 服务，等待客户端连接后推流
+python sample.py --expose-port 1145
+# 连接远端主机，仅接收 WebRTC 画面、不执行本地渲染
+python sample.py --scribe 192.168.1.100:1145
+```
+
+- **`--expose-port PORT`**：在指定端口启动 WebSocket 服务器，准备好 WebRTC 推流；有客户端连接时进行 SDP/ICE 交换并推送当前渲染画面。
+- **`--scribe HOST:PORT`**：连接 `HOST:PORT` 的 WebSocket，获取信令后建立 WebRTC 连接，只显示远端画面，跳过子类内部的 `load_assets`/`render_frame` 等渲染逻辑。
+
 ## 使用方法
 
 安装后，可以直接导入使用：

@@ -19,6 +19,11 @@ dev = [
 sample = [
     "pyvista",
 ]
+stream = [
+    "websockets>=12.0",
+    "aiortc>=1.6",
+    "av>=10.0",
+]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
