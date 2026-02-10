@@ -11,6 +11,9 @@ setup(
         "numpy",
         "torch",
         "opencv-python",
+        "websockets>=12.0",
+        "aiortc>=1.6",
+        "av>=10.0",
     ],
     python_requires=">=3.8",
 )
