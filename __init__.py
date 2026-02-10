@@ -10,6 +10,7 @@ from .holo_viewer import (
     HoloViewer,
     AxisSystem,
     AxisConfig,
+    KeySpec,
     parse_network_args,
     is_client,
     wrap_time,
@@ -26,6 +27,7 @@ from .holo_viewer import (
     _VK_E,
     _VK_TAB,
     _VK_OEM3,
+    _VK_RETURN,
     _win_key,
 )
 
@@ -38,6 +40,7 @@ __all__ = [
     "HoloViewer",
     "AxisSystem",
     "AxisConfig",
+    "KeySpec",
     "parse_network_args",
     "is_client",
     "wrap_time",
@@ -55,6 +58,7 @@ __all__ = [
     "_VK_E",
     "_VK_TAB",
     "_VK_OEM3",
+    "_VK_RETURN",
     "_win_key",
 ]
 

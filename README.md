@@ -36,15 +36,18 @@ python sample.py
 安装流扩展后，子类无需改代码即可通过命令行切换模式：
 
 ```bash
-pip install -e ".[sample,stream]"   # stream 含 websockets, aiortc, av
-# 本地渲染并开启 WebSocket+WebRTC 服务，等待客户端连接后推流
+pip install -e ".[sample,stream]"   # stream 含 websockets + aiortc/av（socket 与 WebRTC 均需）
+# 默认：WebSocket socket 模式（视频+操控同一条连接，适合 SSH 隧道等跨网）
 python sample.py --expose-port 1145
-# 连接远端主机，仅接收 WebRTC 画面、不执行本地渲染
-python sample.py --scribe 192.168.1.100:1145
+python sample.py --subscribe 192.168.1.100:1145
+# 可选：WebRTC 模式（适合局域网；跨网需自建 TURN）
+python sample.py --expose-port 1145 --webrtc
+python sample.py --subscribe 192.168.1.100:1145 --webrtc
 ```
 
-- **`--expose-port PORT`**：在指定端口启动 WebSocket 服务器，准备好 WebRTC 推流；有客户端连接时进行 SDP/ICE 交换并推送当前渲染画面。
-- **`--scribe HOST:PORT`**：连接 `HOST:PORT` 的 WebSocket，获取信令后建立 WebRTC 连接，只显示远端画面，跳过子类内部的 `load_assets`/`render_frame` 等渲染逻辑。
+- **默认 socket 模式**：`--expose-port` 在指定端口启动 WebSocket 服务，经同一条连接推送 H.264 帧并接收 JSON 操控。`--scribe HOST:PORT` 连接后只收帧、不本地渲染。无需 TURN，可经 SSH 反向隧道等跨网使用。
+- **`--webrtc`**：改用 WebRTC 推流（信令 WebSocket + 媒体 ICE）。适合局域网；跨网需公网 TURN。
+- **`--headless`**：与 `--expose-port` 同用时不创建 cv2 窗口，仅跑渲染与推流。
 
 ## 使用方法
 

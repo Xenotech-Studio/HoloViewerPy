@@ -1,4 +1,6 @@
 import argparse
+import asyncio
+import fractions
 import logging
 import math
 import os
@@ -7,7 +9,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from queue import Empty, Queue
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
 logger = logging.getLogger("holoviewer")
 
@@ -30,23 +32,45 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None
 
-# Optional stream deps: pip install holoviewer[stream] (websockets, aiortc, av)
+# Socket 模式与 WebRTC 模式均需 pip install holoviewer[stream] (websockets, aiortc, av)
+_WS_AVAILABLE = False
+try:
+    import websockets  # type: ignore
+    _WS_AVAILABLE = True
+except ImportError:
+    websockets = None  # type: ignore
+
 _STREAM_AVAILABLE = False
 try:
     import asyncio
     import av  # type: ignore
-    from aiortc import RTCIceCandidate, RTCPeerConnection, RTCSessionDescription
+    from aiortc import RTCConfiguration, RTCIceCandidate, RTCIceServer, RTCPeerConnection, RTCSessionDescription
     from aiortc.contrib.media import MediaBlackhole
-    import websockets
+    from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
     _STREAM_AVAILABLE = True
 except ImportError:
     asyncio = None  # type: ignore
     av = None
+    RTCConfiguration = None  # type: ignore
     RTCIceCandidate = None  # type: ignore
+    RTCIceServer = None  # type: ignore
     RTCPeerConnection = None  # type: ignore
     RTCSessionDescription = None  # type: ignore
     MediaBlackhole = None
-    websockets = None  # type: ignore
+    candidate_from_sdp = None  # type: ignore
+    candidate_to_sdp = None  # type: ignore
+
+
+def _default_rtc_configuration() -> Any:
+    """WebRTC ICE 配置：使用公共 STUN，便于跨 NAT（如经 SSH 隧道信令、媒体直连）时建立连接。"""
+    if not _STREAM_AVAILABLE or RTCConfiguration is None or RTCIceServer is None:
+        return None
+    return RTCConfiguration(
+        iceServers=[
+            RTCIceServer(urls="stun:stun.l.google.com:19302"),
+            RTCIceServer(urls="stun:stun1.l.google.com:19302"),
+        ]
+    )
 
 _VK_SHIFT = 0x10
 _VK_CONTROL = 0x11
@@ -60,10 +84,15 @@ _VK_Q = 0x51
 _VK_E = 0x45
 _VK_TAB = 0x09
 _VK_OEM3 = 0xC0
+_VK_OEM_PLUS = 0xBB   # + =
+_VK_OEM_MINUS = 0xBD  # - _
+_VK_OEM_4 = 0xDB     # [
+_VK_OEM_6 = 0xDD     # ]
 _VK_LEFT = 0x25
 _VK_UP = 0x26
 _VK_RIGHT = 0x27
 _VK_DOWN = 0x28
+_VK_RETURN = 0x0D
 _win_key = None
 if os.name == "nt":  # pragma: no cover - platform specific
     try:
@@ -96,12 +125,17 @@ if sys.platform == "darwin":  # pragma: no cover - platform specific
         _kVK_Space = 0x31
         _kVK_Tab = 0x30
         _kVK_ANSI_Grave = 0x32
+        _kVK_ANSI_LeftBracket = 0x21
+        _kVK_ANSI_RightBracket = 0x1E
+        _kVK_ANSI_Minus = 0x1B
+        _kVK_ANSI_Equal = 0x18
         _kVK_Shift = 0x38
         _kVK_Option = 0x3A
         _kVK_LeftArrow = 0x7B
         _kVK_RightArrow = 0x7C
         _kVK_UpArrow = 0x7E
         _kVK_DownArrow = 0x7D
+        _kVK_Return = 0x24
 
         def _mac_key_state(vk: int) -> bool:
             return bool(_cg.CGEventSourceKeyState(_kCGEventSourceStateCombinedSessionState, vk))
@@ -116,12 +150,17 @@ if sys.platform == "darwin":  # pragma: no cover - platform specific
             "space": _kVK_Space,
             "tab": _kVK_Tab,
             "grave": _kVK_ANSI_Grave,
+            "bracket_left": _kVK_ANSI_LeftBracket,
+            "bracket_right": _kVK_ANSI_RightBracket,
+            "minus": _kVK_ANSI_Minus,
+            "plus": _kVK_ANSI_Equal,
             "shift": _kVK_Shift,
             "option": _kVK_Option,
             "left": _kVK_LeftArrow,
             "right": _kVK_RightArrow,
             "up": _kVK_UpArrow,
             "down": _kVK_DownArrow,
+            "return": _kVK_Return,
         }
 
         def _mac_key(vk_name: str) -> bool:
@@ -132,6 +171,69 @@ if sys.platform == "darwin":  # pragma: no cover - platform specific
         _mac_key = _mac_key
     except Exception:  # pragma: no cover
         _mac_key = None
+
+# Key name -> (vk, mac_name, cv2_keys). 内置映射，subclass 可用元组自定义。
+# vk: Windows GetAsyncKeyState; mac_name: _mac_key 参数; cv2_keys: cv2.waitKey 返回值
+_KEY_MAP: Dict[str, Tuple[Optional[int], Optional[str], List[int]]] = {
+    "escape": (0x1B, None, [27]),
+    "tab": (_VK_TAB, "tab", [9]),
+    "space": (_VK_SPACE, "space", [32]),
+    "grave": (_VK_OEM3, "grave", [96, 126]),
+    "w": (_VK_W, "w", [ord("w"), ord("W")]),
+    "a": (_VK_A, "a", [ord("a"), ord("A")]),
+    "s": (_VK_S, "s", [ord("s"), ord("S")]),
+    "d": (_VK_D, "d", [ord("d"), ord("D")]),
+    "q": (_VK_Q, "q", [ord("q"), ord("Q")]),
+    "e": (_VK_E, "e", [ord("e"), ord("E")]),
+    "plus": (_VK_OEM_PLUS, "plus", [ord("+"), ord("=")]),
+    "minus": (_VK_OEM_MINUS, "minus", [ord("-"), ord("_")]),
+    "bracket_left": (_VK_OEM_4, "bracket_left", [ord("[")]),
+    "bracket_right": (_VK_OEM_6, "bracket_right", [ord("]")]),
+    "left": (_VK_LEFT, "left", []),
+    "right": (_VK_RIGHT, "right", []),
+    "up": (_VK_UP, "up", []),
+    "down": (_VK_DOWN, "down", []),
+}
+
+# 类型：key_spec 可为 int(VK)、str(名称)、或 (vk, mac_name, cv2_keys) 元组
+KeySpec = Union[int, str, Tuple[Optional[int], Optional[str], List[int]]]
+
+
+def _key_spec_hashable(key_spec: KeySpec) -> Union[int, str, Tuple[Optional[int], Optional[str], Tuple[int, ...]]]:
+    """转为可 hash 的 key，用于 _key_handler_prev 等 dict。"""
+    if isinstance(key_spec, tuple) and len(key_spec) >= 3:
+        return (key_spec[0], key_spec[1], tuple(key_spec[2]))
+    return key_spec  # type: ignore
+
+
+def _resolve_key_spec(key_spec: KeySpec) -> Tuple[Optional[int], Optional[str], List[int]]:
+    """将 key_spec 解析为 (vk, mac_name, cv2_keys)。支持 int、str、或 (vk, mac_name, cv2_keys) 元组。"""
+    if isinstance(key_spec, tuple) and len(key_spec) >= 3:
+        return (key_spec[0], key_spec[1], key_spec[2])
+    if isinstance(key_spec, int):
+        return (key_spec, None, [])
+    name = key_spec.lower() if isinstance(key_spec, str) else ""
+    if name in _KEY_MAP:
+        return _KEY_MAP[name]
+    if len(name) == 1:
+        c = name[0]
+        vk = (0x41 + (ord(c.upper()) - ord("A"))) if c.isalpha() else None
+        mac_name = c if c.isalpha() else None
+        cv2_keys = [ord(c), ord(c.upper())] if c.isalpha() else [ord(c)]
+        return (vk, mac_name, cv2_keys)
+    return (None, None, [])
+
+
+def _is_key_pressed(key_spec: KeySpec, key_from_cv2: Optional[int]) -> bool:
+    """检查按键是否按下。key_spec: VK(int) 或 名称(str)。key_from_cv2: cv2.waitKey 返回值。"""
+    vk, mac_name, cv2_keys = _resolve_key_spec(key_spec)
+    if _win_key is not None and vk is not None:
+        return bool(_win_key.GetAsyncKeyState(vk) & 0x8000)
+    if _mac_key is not None and mac_name is not None:
+        return _mac_key(mac_name)
+    if key_from_cv2 is not None and cv2_keys and key_from_cv2 in cv2_keys:
+        return True
+    return False
 
 
 class AxisConfig(NamedTuple):
@@ -248,26 +350,27 @@ def to_uint8_bgr(image_tensor: torch.Tensor) -> np.ndarray:
     return img[:, :, ::-1]
 
 
-def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool]:
-    """Parse --expose-port、--scribe、--subscribe、--headless from argv. Returns (expose_port, scribe_addr, headless)."""
+def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool, bool]:
+    """Parse --expose-port、--scribe、--subscribe、--headless、--webrtc from argv. Returns (expose_port, scribe_addr, headless, use_webrtc)."""
     if argv is None:
         argv = sys.argv[1:]
     parser = argparse.ArgumentParser()
-    parser.add_argument("--expose-port", type=int, default=None, metavar="PORT", help="Start WebSocket+WebRTC server on PORT for streaming")
-    parser.add_argument("--scribe", type=str, default=None, metavar="HOST:PORT", help="Connect to remote HOST:PORT and display WebRTC stream (no local render)")
-    parser.add_argument("--subscribe", type=str, default=None, metavar="HOST:PORT or PORT", help="Same as --scribe; if only PORT is given, use 127.0.0.1:PORT. When set, local render is never used.")
+    parser.add_argument("--expose-port", type=int, default=None, metavar="PORT", help="Start WebSocket server on PORT for streaming (default: socket mode; use --webrtc for WebRTC)")
+    parser.add_argument("--scribe", type=str, default=None, metavar="HOST:PORT", help="Connect to remote HOST:PORT and display stream (no local render)")
+    parser.add_argument("--subscribe", type=str, default=None, metavar="HOST:PORT or PORT", help="Same as --scribe; if only PORT, use 127.0.0.1:PORT")
     parser.add_argument("--headless", action="store_true", help="No cv2 window; use with --expose-port to run server and render pipeline only.")
+    parser.add_argument("--webrtc", action="store_true", help="Use WebRTC for streaming (LAN only without TURN); default is WebSocket/socket mode for cross-network (e.g. SSH tunnel)")
     args, _ = parser.parse_known_args(argv)
     expose_port = args.expose_port
     scribe_addr = args.scribe or args.subscribe
     if scribe_addr and ":" not in scribe_addr:
         scribe_addr = "127.0.0.1:" + scribe_addr
-    return expose_port, scribe_addr, getattr(args, "headless", False)
+    return expose_port, scribe_addr, getattr(args, "headless", False), getattr(args, "webrtc", False)
 
 
 def is_client(argv: Optional[List[str]] = None) -> bool:
     """True 表示当前为订阅端（--scribe/--subscribe），仅收流不渲染，可据此延迟导入仅服务端需要的包。"""
-    _, scribe_addr, _ = parse_network_args(argv)
+    _, scribe_addr, _, _ = parse_network_args(argv)
     return scribe_addr is not None
 
 
@@ -363,7 +466,7 @@ def _run_expose_server(
                 logger.info("Received message from client: type=%s", msg_type)
                 if msg_type == "offer":
                     logger.info("Creating RTCPeerConnection and video track ...")
-                    pc = RTCPeerConnection()
+                    pc = RTCPeerConnection(_default_rtc_configuration())
                     frame_track = QueueVideoTrack(q, stop)
                     pc.addTrack(frame_track)
                     @pc.on("datachannel")
@@ -394,18 +497,24 @@ def _run_expose_server(
                     @pc.on("icecandidate")
                     def on_ice(candidate: Any) -> None:
                         if candidate:
+                            cand_str = "candidate:" + candidate_to_sdp(candidate)
                             asyncio.ensure_future(websocket.send(__import__("json").dumps({
                                 "type": "candidate",
-                                "candidate": candidate.candidate,
-                                "sdpMid": candidate.sdpMid,
-                                "sdpMLineIndex": candidate.sdpMLineIndex,
+                                "candidate": cand_str,
+                                "sdpMid": getattr(candidate, "sdpMid", None),
+                                "sdpMLineIndex": getattr(candidate, "sdpMLineIndex", None),
                             })))
                     while not stop.is_set():
                         try:
                             recv_msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                             recv_data = __import__("json").loads(recv_msg)
                             if recv_data.get("type") == "candidate" and recv_data.get("candidate"):
-                                await pc.addIceCandidate(RTCIceCandidate(recv_data["candidate"], recv_data.get("sdpMid"), recv_data.get("sdpMLineIndex")))
+                                raw = recv_data["candidate"]
+                                sdp_part = raw.split(":", 1)[1] if isinstance(raw, str) and ":" in raw else raw
+                                c = candidate_from_sdp(sdp_part)
+                                c.sdpMid = recv_data.get("sdpMid")
+                                c.sdpMLineIndex = recv_data.get("sdpMLineIndex")
+                                await pc.addIceCandidate(c)
                         except asyncio.TimeoutError:
                             continue
                         except Exception:
@@ -435,7 +544,187 @@ def _run_expose_server(
         logger.info("WebSocket server stopped")
 
 
-def _run_scribe_client(
+def _run_expose_server_socket(
+    port: int,
+    frame_queue: "Queue[Tuple[np.ndarray, float]]",
+    stop_ev: threading.Event,
+    camera_command_queue: "Queue[Tuple[np.ndarray, float, float]]",
+    viewer: "HoloViewer",
+) -> None:
+    """WebSocket 纯 socket 模式：服务端经同一条连接发 H.264 帧、收 JSON 操控，无需 WebRTC/ICE。
+    低延迟：只发最新帧、周期性 I 帧、rc_lookahead=0。自适应画质：根据客户端 stats 反馈调节码率与分辨率。"""
+    if not _WS_AVAILABLE or websockets is None:
+        return
+    if not _STREAM_AVAILABLE or av is None:
+        logger.error("Socket mode (H.264) requires: pip install holoviewer[stream] (websockets, aiortc, av)")
+        return
+    json_mod = __import__("json")
+
+    async def _serve_socket(
+        ws_port: int,
+        q: "Queue[Tuple[np.ndarray, float]]",
+        stop: threading.Event,
+        cam_queue: "Queue[Tuple[np.ndarray, float, float]]",
+        v: "HoloViewer",
+    ) -> None:
+        remote_pos: Optional[np.ndarray] = None
+        remote_yaw: Optional[float] = None
+        remote_pitch: Optional[float] = None
+
+        def init_remote() -> None:
+            nonlocal remote_pos, remote_yaw, remote_pitch
+            if remote_pos is not None:
+                return
+            pos, forward = v.get_initial_pose()
+            pos = pos.astype(np.float64)
+            forward = forward / (np.linalg.norm(forward) + 1e-9)
+            remote_yaw, remote_pitch = v.axis_system.look_dir_to_angles(forward)
+            remote_pos = pos
+
+        async def handler(websocket: Any) -> None:
+            nonlocal remote_pos, remote_yaw, remote_pitch
+            peer = getattr(websocket, "remote_address", None) or "unknown"
+            logger.info("Client connected (WebSocket socket mode), peer=%s", peer)
+            try:
+                await websocket.send(json_mod.dumps({"type": "tunnel", "version": 1, "codec": "h264"}))
+                loop = asyncio.get_running_loop()
+
+                # 自适应画质（类似 WebRTC REMB/反馈）：根据客户端 stats 调节码率与分辨率
+                _BITRATE_STEPS = [300_000, 500_000, 700_000, 1_000_000, 1_500_000]
+                _SCALE_STEPS = [0.5, 0.75, 1.0]
+                adaptive = {"bitrate_idx": 4, "scale_idx": 2}  # 初始最高质量
+
+                # 低延迟：只编码并发送最新一帧，丢弃积压的旧帧（last-frame-wins）
+                def _get_latest_frame() -> Optional[Tuple[np.ndarray, float]]:
+                    latest: Optional[Tuple[np.ndarray, float]] = None
+                    try:
+                        latest = q.get(timeout=0.5)
+                    except Empty:
+                        return None
+                    while True:
+                        try:
+                            latest = q.get_nowait()
+                        except Empty:
+                            break
+                    return latest
+
+                # 周期性关键帧（每 KEYFRAME_INTERVAL 帧一个 I 帧，便于恢复与限时延）
+                _KEYFRAME_INTERVAL = 30  # 约 1 秒 @ 30fps
+
+                async def send_frames() -> None:
+                    codec: Optional[Any] = None
+                    pts = 0
+                    time_base = fractions.Fraction(1, 30)
+                    while not stop.is_set():
+                        try:
+                            item = await loop.run_in_executor(None, _get_latest_frame)
+                            if item is None:
+                                continue
+                            frame_bgr, _ = item
+                            h, w = frame_bgr.shape[:2]
+                            scale = _SCALE_STEPS[adaptive["scale_idx"]]
+                            encode_w = max(64, int(w * scale))
+                            encode_h = max(64, int(h * scale))
+                            if scale < 1.0 and cv2 is not None:
+                                frame_bgr = cv2.resize(frame_bgr, (encode_w, encode_h), interpolation=cv2.INTER_LINEAR)
+                            else:
+                                encode_w, encode_h = w, h
+                            bitrate = _BITRATE_STEPS[adaptive["bitrate_idx"]]
+                            if codec is None or codec.width != encode_w or codec.height != encode_h:
+                                codec = av.CodecContext.create("libx264", "w")
+                                codec.width = encode_w
+                                codec.height = encode_h
+                                codec.pix_fmt = "yuv420p"
+                                codec.time_base = time_base
+                                codec.framerate = time_base
+                                codec.bit_rate = bitrate
+                                codec.options = {
+                                    "tune": "zerolatency",
+                                    "level": "31",
+                                    "rc_lookahead": "0",  # 禁用 lookahead，降低编码延迟
+                                }
+                                codec.profile = "baseline"
+                            if codec.bit_rate != bitrate:
+                                codec.bit_rate = bitrate
+                            pts += 1
+                            av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
+                            av_frame.pts = pts
+                            av_frame.time_base = time_base
+                            if pts == 1 or (pts % _KEYFRAME_INTERVAL) == 1:
+                                av_frame.pict_type = av.video.frame.PictureType.I
+                            else:
+                                av_frame.pict_type = av.video.frame.PictureType.NONE
+                            data = b""
+                            for packet in codec.encode(av_frame):
+                                data += bytes(packet)
+                            if data:
+                                await websocket.send(data)
+                        except Exception:
+                            break
+
+                async def recv_control() -> None:
+                    nonlocal remote_pos, remote_yaw, remote_pitch
+                    while not stop.is_set():
+                        try:
+                            msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                            if isinstance(msg, str):
+                                recv_data = json_mod.loads(msg)
+                                msg_type = recv_data.get("type")
+                                if msg_type == "stats":
+                                    # 客户端上报丢帧/收帧，用于自适应降画质（类似 WebRTC 的 REMB/反馈）
+                                    dropped = recv_data.get("dropped", 0)
+                                    received = max(recv_data.get("received", 0), 1)
+                                    ratio = dropped / received
+                                    if ratio > 0.15:
+                                        if adaptive["bitrate_idx"] > 0:
+                                            adaptive["bitrate_idx"] -= 1
+                                            logger.debug("Adaptive: lower bitrate (dropped=%d received=%d)", dropped, received)
+                                        elif adaptive["scale_idx"] > 0:
+                                            adaptive["scale_idx"] -= 1
+                                            logger.debug("Adaptive: lower resolution (dropped=%d received=%d)", dropped, received)
+                                    elif ratio < 0.05 and received > 15:
+                                        if adaptive["scale_idx"] < len(_SCALE_STEPS) - 1:
+                                            adaptive["scale_idx"] += 1
+                                            logger.debug("Adaptive: raise resolution (dropped=%d received=%d)", dropped, received)
+                                        elif adaptive["bitrate_idx"] < len(_BITRATE_STEPS) - 1:
+                                            adaptive["bitrate_idx"] += 1
+                                            logger.debug("Adaptive: raise bitrate (dropped=%d received=%d)", dropped, received)
+                                    continue
+                                init_remote()
+                                pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
+                                remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                                try:
+                                    cam_queue.put_nowait((pos, yaw, pitch))
+                                except Exception:
+                                    pass
+                        except asyncio.TimeoutError:
+                            continue
+                        except Exception:
+                            break
+
+                await asyncio.gather(send_frames(), recv_control())
+            except Exception as e:
+                logger.warning("Socket handler error: %s", e)
+            finally:
+                logger.info("Client disconnected (peer=%s)", peer)
+
+        logger.info("WebSocket (socket) server binding to 0.0.0.0:%s ...", ws_port)
+        async with websockets.serve(handler, "0.0.0.0", ws_port, ping_interval=None, ping_timeout=None, close_timeout=1):  # type: ignore
+            logger.info("Socket mode ready. Subscribe: --subscribe 127.0.0.1:%s or <this-ip>:%s", ws_port, ws_port)
+            await asyncio.get_event_loop().run_in_executor(None, stop.wait)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_serve_socket(port, frame_queue, stop_ev, camera_command_queue, viewer))
+    except Exception:
+        logger.exception("Socket expose server failed")
+    finally:
+        loop.close()
+        logger.info("WebSocket (socket) server stopped")
+
+
+def _run_scribe_client_webrtc(
     addr: str,
     frame_queue: "Queue[Any]",  # 可放入 np.ndarray | ("error", str) | None
     stop_ev: threading.Event,
@@ -480,7 +769,7 @@ def _run_scribe_client(
         stop: threading.Event,
         cam_send_q: Optional["Queue[Dict[str, Any]]"] = None,
     ) -> None:
-        pc = RTCPeerConnection()
+        pc = RTCPeerConnection(_default_rtc_configuration())
         pc.addTransceiver("video", direction="recvonly")
         input_channel: Optional[Any] = None
         if cam_send_q is not None:
@@ -504,15 +793,17 @@ def _run_scribe_client(
             async with websockets.connect(uri_inner, ping_interval=None, ping_timeout=None, close_timeout=2, open_timeout=connect_timeout) as ws:  # type: ignore
                 logger.info("WebSocket connected to %s, sending SDP offer ...", uri_inner)
                 send_task: Optional[asyncio.Task[None]] = None
+                recv_ice_task: Optional[asyncio.Task[None]] = None
                 await ws.send(__import__("json").dumps({"type": pc.localDescription.type, "sdp": pc.localDescription.sdp}))
                 @pc.on("icecandidate")
                 def on_ice(candidate: Any) -> None:
                     if candidate:
+                        cand_str = "candidate:" + candidate_to_sdp(candidate)
                         asyncio.get_event_loop().create_task(ws.send(__import__("json").dumps({
                             "type": "candidate",
-                            "candidate": candidate.candidate,
-                            "sdpMid": candidate.sdpMid,
-                            "sdpMLineIndex": candidate.sdpMLineIndex,
+                            "candidate": cand_str,
+                            "sdpMid": getattr(candidate, "sdpMid", None),
+                            "sdpMLineIndex": getattr(candidate, "sdpMLineIndex", None),
                         })))
                 logger.info("Waiting for SDP answer from server (timeout 15s) ...")
                 try:
@@ -523,9 +814,40 @@ def _run_scribe_client(
                 answer_data = __import__("json").loads(msg)
                 logger.info("SDP answer received, setting remote description ...")
                 await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_data["sdp"], type=answer_data["type"]))
+
+                async def _recv_ice_loop() -> None:
+                    """持续接收服务端发来的 ICE 候选并加入 PC，否则跨网时 ICE 无法建立。"""
+                    while not stop.is_set():
+                        try:
+                            recv_msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            recv_data = __import__("json").loads(recv_msg)
+                            if recv_data.get("type") == "candidate":
+                                cand = recv_data.get("candidate")
+                                if cand:
+                                    sdp_part = cand.split(":", 1)[1] if isinstance(cand, str) and ":" in cand else cand
+                                    c = candidate_from_sdp(sdp_part)
+                                    c.sdpMid = recv_data.get("sdpMid")
+                                    c.sdpMLineIndex = recv_data.get("sdpMLineIndex")
+                                    await pc.addIceCandidate(c)
+                                else:
+                                    await pc.addIceCandidate(None)
+                        except asyncio.TimeoutError:
+                            continue
+                        except Exception:
+                            break
+                recv_ice_task = asyncio.create_task(_recv_ice_loop())
+
                 logger.info("Waiting for video track (timeout 10s) ...")
                 remote_track = await asyncio.wait_for(track_received, timeout=10.0)
                 logger.info("Video track received, streaming from %s", uri_inner)
+
+                ice_connected_timeout = 15.0
+                t0 = time.monotonic()
+                while (time.monotonic() - t0) < ice_connected_timeout and getattr(pc, "connectionState", "") not in ("connected",):
+                    await asyncio.sleep(0.1)
+                if getattr(pc, "connectionState", "") != "connected":
+                    logger.warning("ICE/connection did not reach 'connected' within %.0fs; attempting stream anyway", ice_connected_timeout)
+
                 if input_channel is not None and channel_open_ev is not None and cam_send_q is not None:
                     try:
                         await asyncio.wait_for(channel_open_ev.wait(), timeout=5.0)
@@ -548,6 +870,12 @@ def _run_scribe_client(
                             put_error(str(e))
                             break
                 finally:
+                    if recv_ice_task is not None:
+                        recv_ice_task.cancel()
+                        try:
+                            await recv_ice_task
+                        except asyncio.CancelledError:
+                            pass
                     if send_task is not None:
                         send_task.cancel()
                         try:
@@ -574,6 +902,142 @@ def _run_scribe_client(
         loop.run_until_complete(_client(host, port, frame_queue, stop_ev, camera_send_queue))
     except Exception as e:
         logger.exception("Subscribe client failed")
+        put_error(str(e))
+        try:
+            frame_queue.put_nowait(None)
+        except Exception:
+            pass
+    finally:
+        loop.close()
+
+
+def _run_scribe_client_socket(
+    addr: str,
+    frame_queue: "Queue[Any]",
+    stop_ev: threading.Event,
+    camera_send_queue: Optional["Queue[Dict[str, Any]]"] = None,
+) -> None:
+    """WebSocket 纯 socket 模式：客户端经同一条连接收 H.264 帧、发 JSON 操控。低延迟：只保留最新帧。自适应：定期上报 stats 供服务端降画质。"""
+    if not _WS_AVAILABLE or websockets is None:
+        try:
+            frame_queue.put_nowait(("error", "Socket mode requires: pip install websockets"))
+        except Exception:
+            pass
+        return
+    if not _STREAM_AVAILABLE or av is None:
+        try:
+            frame_queue.put_nowait(("error", "Socket mode (H.264) requires: pip install holoviewer[stream] (websockets, aiortc, av)"))
+        except Exception:
+            pass
+        return
+    host, port_s = addr.rsplit(":", 1)
+    port = int(port_s)
+    uri = f"ws://{host}:{port}"
+    json_mod = __import__("json")
+    connect_timeout = 10
+
+    def put_error(msg: str) -> None:
+        logger.error("Subscribe (socket) error: %s", msg)
+        try:
+            frame_queue.put_nowait(("error", msg))
+        except Exception:
+            pass
+
+    async def _client() -> None:
+        try:
+            async with websockets.connect(uri, ping_interval=None, ping_timeout=None, close_timeout=2, open_timeout=connect_timeout) as ws:  # type: ignore
+                first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                if isinstance(first, str):
+                    data = json_mod.loads(first)
+                    if data.get("type") != "tunnel":
+                        put_error("Expected tunnel greeting from server")
+                        return
+                else:
+                    put_error("Expected tunnel greeting (string), got binary")
+                    return
+
+                decoder = av.CodecContext.create("h264", "r")
+                time_base = fractions.Fraction(1, 30)
+                # 用于自适应画质：统计丢帧/收帧，定期上报服务端（类似 WebRTC REMB 反馈）
+                stats = [0, 0]  # [dropped, received]
+
+                def decode_and_put(msg: bytes) -> None:
+                    if not msg:
+                        return
+                    try:
+                        packet = av.Packet(msg)
+                        packet.pts = 0
+                        packet.time_base = time_base
+                        for frame in decoder.decode(packet):
+                            arr = frame.to_ndarray(format="bgr24")
+                            try:
+                                # 低延迟：只保留最新一帧，丢弃积压的旧帧
+                                dropped = 0
+                                while not frame_queue.empty():
+                                    try:
+                                        frame_queue.get_nowait()
+                                        dropped += 1
+                                    except Exception:
+                                        break
+                                frame_queue.put_nowait(arr)
+                                stats[0] += dropped
+                                stats[1] += 1
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                async def recv_frames() -> None:
+                    while not stop_ev.is_set():
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            if isinstance(msg, bytes):
+                                decode_and_put(msg)
+                        except asyncio.TimeoutError:
+                            continue
+                        except Exception:
+                            break
+
+                async def send_stats() -> None:
+                    """定期上报丢帧/收帧，供服务端做自适应码率与分辨率。"""
+                    while not stop_ev.is_set():
+                        await asyncio.sleep(1.0)
+                        if stop_ev.is_set():
+                            break
+                        try:
+                            await ws.send(json_mod.dumps({"type": "stats", "dropped": stats[0], "received": stats[1]}))
+                            stats[0], stats[1] = 0, 0
+                        except Exception:
+                            break
+
+                async def send_control() -> None:
+                    while not stop_ev.is_set() and camera_send_queue is not None:
+                        try:
+                            inp = camera_send_queue.get_nowait()
+                            await ws.send(json_mod.dumps(inp))
+                        except Empty:
+                            await asyncio.sleep(0.02)
+                        except Exception:
+                            break
+
+                if camera_send_queue is not None:
+                    await asyncio.gather(recv_frames(), send_control(), send_stats())
+                else:
+                    await asyncio.gather(recv_frames(), send_stats())
+        except Exception as e:
+            put_error(str(e))
+        finally:
+            try:
+                frame_queue.put_nowait(None)
+            except Exception:
+                pass
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_client())
+    except Exception as e:
+        logger.exception("Socket subscribe client failed")
         put_error(str(e))
         try:
             frame_queue.put_nowait(None)
@@ -640,35 +1104,75 @@ class HoloViewer(ABC):
         self._ctrl_click_pos: Optional[Tuple[int, int]] = None
         self._expose_port = expose_port
         self._scribe_addr = scribe_addr
+        # Subclass extensibility: keyboard callbacks, FPS overlay, window title suffix
+        self._key_handlers: List[Tuple[KeySpec, Callable[["HoloViewer"], None]]] = []
+        self._key_handler_prev: Dict[Any, bool] = {}
+        self.show_fps = False
+        self.show_window_resize_log = False
 
-    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str], bool]:
-        """Return (expose_port, scribe_addr, headless). If not set in __init__, parse from sys.argv."""
+    def register_key_handler(
+        self,
+        key: KeySpec,
+        callback: Callable[["HoloViewer"], None],
+    ) -> None:
+        """Register a keyboard callback. Called on key press (edge-triggered).
+        key: VK (int), name (str), or custom tuple (vk, mac_name, cv2_keys).
+        Example: register_key_handler((_VK_W, "w", [ord("w"), ord("W")]), cb)
+        """
+        self._key_handlers.append((key, callback))
+
+    def on_frame_camera_update(
+        self, pos: np.ndarray, yaw: float, pitch: float, dt: float
+    ) -> Optional[Tuple[np.ndarray, float, float]]:
+        """Override to modify camera before rendering. Return (pos, yaw, pitch) to override, or None to use default."""
+        return None
+
+    def on_frame_draw(self, img_bgr: np.ndarray) -> None:
+        """Override to draw overlay on image after axes."""
+        pass
+
+    def get_window_title_suffix(self) -> str:
+        """Override to return dynamic suffix for window title."""
+        return ""
+
+    def should_draw_axes(self) -> bool:
+        """Override to control axes overlay. Default: self._show_axes_flag."""
+        return self._show_axes_flag
+
+    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str], bool, bool]:
+        """Return (expose_port, scribe_addr, headless, use_webrtc). If not set in __init__, parse from sys.argv."""
         expose = self._expose_port
         scribe = self._scribe_addr
         if expose is None and scribe is None:
-            expose, scribe, headless = parse_network_args()
+            expose, scribe, headless, use_webrtc = parse_network_args()
         else:
-            _, _, headless = parse_network_args()
-        return expose, scribe, headless
+            _, _, headless, use_webrtc = parse_network_args()
+        return expose, scribe, headless, use_webrtc
 
     def run(self) -> None:
         _ensure_console_logging()
-        expose_port, scribe_addr, headless = self._get_network_mode()
+        expose_port, scribe_addr, headless, use_webrtc = self._get_network_mode()
         if scribe_addr:
-            logger.info("Subscribe mode: connecting to %s (no local render)", scribe_addr)
-            self._run_scribe(scribe_addr)
+            logger.info("Subscribe mode: connecting to %s (no local render)%s", scribe_addr, " [WebRTC]" if use_webrtc else " [WebSocket]")
+            if use_webrtc:
+                self._run_scribe_webrtc(scribe_addr)
+            else:
+                self._run_scribe_socket(scribe_addr)
             return
         if expose_port is not None:
-            logger.info("Expose mode: WebSocket+WebRTC server on port %s%s", expose_port, " (headless)" if headless else "")
-            self._run_expose(expose_port, headless=headless)
+            logger.info("Expose mode: WebSocket server on port %s%s%s", expose_port, " (headless)" if headless else "", " [WebRTC]" if use_webrtc else " [WebSocket]")
+            if use_webrtc:
+                self._run_expose_webrtc(expose_port, headless=headless)
+            else:
+                self._run_expose_socket(expose_port, headless=headless)
             return
         logger.info("Local mode: running render pipeline")
         self._run_local()
 
-    def _run_scribe(self, addr: str) -> None:
-        """连接远端 WebSocket，通过 WebRTC 接收画面并显示，不执行本地渲染；同时采集本机视角操作并发送给服务端驱动远端相机。"""
+    def _run_scribe_webrtc(self, addr: str) -> None:
+        """连接远端 WebSocket，通过 WebRTC 接收画面并显示（需 --webrtc；适合局域网）。"""
         if not _STREAM_AVAILABLE:
-            raise RuntimeError("Scribe mode requires: pip install holoviewer[stream] (websockets, aiortc, av)")
+            raise RuntimeError("Scribe mode (WebRTC) requires: pip install holoviewer[stream] (websockets, aiortc, av)")
         if cv2 is None:
             raise RuntimeError("OpenCV (cv2) is required.")
         frame_queue: "Queue[Any]" = Queue(maxsize=2)
@@ -676,6 +1180,26 @@ class HoloViewer(ABC):
         stop_ev = threading.Event()
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, self.width, self.height)
+        thread = threading.Thread(
+            target=_run_scribe_client_webrtc,
+            args=(addr, frame_queue, stop_ev, camera_send_queue),
+            daemon=True,
+        )
+        thread.start()
+        self._scribe_display_loop(frame_queue, stop_ev, addr, thread, camera_send_queue)
+
+    def _scribe_display_loop(
+        self,
+        frame_queue: "Queue[Any]",
+        stop_ev: threading.Event,
+        addr: str,
+        thread: threading.Thread,
+        camera_send_queue: "Queue[Dict[str, Any]]",
+    ) -> None:
+        """订阅端共用的显示与按键循环：从 frame_queue 取图显示，采集按键/鼠标送 camera_send_queue。"""
+        last_img: Optional[np.ndarray] = None
+        error_msg: Optional[str] = None
+        disconnected = False
         self._dragging = False
         self._pan_dragging = False
         self._left_dragging = False
@@ -705,15 +1229,6 @@ class HoloViewer(ABC):
                 mouse_delta[1] += dy
 
         cv2.setMouseCallback(self.window_name, on_mouse_scribe)
-        thread = threading.Thread(
-            target=_run_scribe_client,
-            args=(addr, frame_queue, stop_ev, camera_send_queue),
-            daemon=True,
-        )
-        thread.start()
-        last_img: Optional[np.ndarray] = None
-        error_msg: Optional[str] = None
-        disconnected = False
         try:
             while True:
                 key = cv2.waitKey(1) & 0xFF
@@ -726,6 +1241,7 @@ class HoloViewer(ABC):
                     break
                 w = a = s = d = space = shift = alt = 0
                 left = right = up = down = 0
+                tab = plus = minus = bracket_left = bracket_right = q = e = toggle_axes = 0
                 if _win_key is not None:
                     w = 1 if (_win_key.GetAsyncKeyState(_VK_W) & 0x8000) else 0
                     a = 1 if (_win_key.GetAsyncKeyState(_VK_A) & 0x8000) else 0
@@ -738,6 +1254,14 @@ class HoloViewer(ABC):
                     right = 1 if (_win_key.GetAsyncKeyState(_VK_RIGHT) & 0x8000) else 0
                     up = 1 if (_win_key.GetAsyncKeyState(_VK_UP) & 0x8000) else 0
                     down = 1 if (_win_key.GetAsyncKeyState(_VK_DOWN) & 0x8000) else 0
+                    tab = 1 if (_win_key.GetAsyncKeyState(_VK_TAB) & 0x8000) else 0
+                    plus = 1 if (_win_key.GetAsyncKeyState(_VK_OEM_PLUS) & 0x8000) else 0
+                    minus = 1 if (_win_key.GetAsyncKeyState(_VK_OEM_MINUS) & 0x8000) else 0
+                    bracket_left = 1 if (_win_key.GetAsyncKeyState(_VK_OEM_4) & 0x8000) else 0
+                    bracket_right = 1 if (_win_key.GetAsyncKeyState(_VK_OEM_6) & 0x8000) else 0
+                    q = 1 if (_win_key.GetAsyncKeyState(_VK_Q) & 0x8000) else 0
+                    e = 1 if (_win_key.GetAsyncKeyState(_VK_E) & 0x8000) else 0
+                    toggle_axes = 1 if (_win_key.GetAsyncKeyState(_VK_OEM3) & 0x8000) else 0
                 elif _mac_key is not None:
                     w = 1 if _mac_key("w") else 0
                     a = 1 if _mac_key("a") else 0
@@ -750,8 +1274,17 @@ class HoloViewer(ABC):
                     right = 1 if _mac_key("right") else 0
                     up = 1 if _mac_key("up") else 0
                     down = 1 if _mac_key("down") else 0
+                    tab = 1 if _mac_key("tab") else 0
+                    plus = 1 if _mac_key("plus") else 0
+                    minus = 1 if _mac_key("minus") else 0
+                    bracket_left = 1 if _mac_key("bracket_left") else 0
+                    bracket_right = 1 if _mac_key("bracket_right") else 0
+                    q = 1 if _mac_key("q") else 0
+                    e = 1 if _mac_key("e") else 0
+                    toggle_axes = 1 if _mac_key("grave") else 0
                 dx, dy = mouse_delta[0], mouse_delta[1]
                 mouse_delta[0], mouse_delta[1] = 0.0, 0.0
+                key_cv2 = key if key != 255 else None
                 inp = {
                     "w": w, "a": a, "s": s, "d": d,
                     "space": space, "shift": shift, "alt": alt,
@@ -759,7 +1292,12 @@ class HoloViewer(ABC):
                     "mouse_dx": dx, "mouse_dy": dy,
                     "is_rotate": bool(self._dragging or self._left_dragging),
                     "is_pan": bool(self._pan_dragging),
+                    "tab": tab, "plus": plus, "minus": minus,
+                    "bracket_left": bracket_left, "bracket_right": bracket_right,
+                    "q": q, "e": e, "toggle_axes": toggle_axes,
                 }
+                for i, (key_spec, _) in enumerate(self._key_handlers):
+                    inp[f"custom_{i}"] = 1 if _is_key_pressed(key_spec, key_cv2) else 0
                 try:
                     camera_send_queue.put_nowait(inp)
                 except Exception:
@@ -796,10 +1334,32 @@ class HoloViewer(ABC):
                     cv2.imshow(self.window_name, last_img)
         finally:
             stop_ev.set()
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
 
-    def _run_expose(self, port: int, headless: bool = False) -> None:
-        """本地渲染（主线程）+ WebSocket 服务（子线程）。headless 时不创建 cv2 窗口，仅跑渲染与推流。"""
+    def _run_scribe_socket(self, addr: str) -> None:
+        """连接远端 WebSocket（默认 socket 模式），经同一条连接收 H.264 帧与发操控，适合 SSH 隧道等跨网。"""
+        if not _WS_AVAILABLE or not _STREAM_AVAILABLE or av is None:
+            raise RuntimeError("Socket mode (H.264) requires: pip install holoviewer[stream] (websockets, aiortc, av)")
+        if cv2 is None:
+            raise RuntimeError("OpenCV (cv2) is required.")
+        frame_queue: "Queue[Any]" = Queue(maxsize=2)
+        camera_send_queue: "Queue[Dict[str, Any]]" = Queue(maxsize=8)
+        stop_ev = threading.Event()
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, self.width, self.height)
+        thread = threading.Thread(
+            target=_run_scribe_client_socket,
+            args=(addr, frame_queue, stop_ev, camera_send_queue),
+            daemon=True,
+        )
+        thread.start()
+        self._scribe_display_loop(frame_queue, stop_ev, addr, thread, camera_send_queue)
+
+    def _run_expose_webrtc(self, port: int, headless: bool = False) -> None:
+        """本地渲染 + WebRTC 服务（--webrtc；适合局域网）。"""
         if not _STREAM_AVAILABLE:
             raise RuntimeError("Expose mode requires: pip install holoviewer[stream] (websockets, aiortc, av)")
         frame_queue: "Queue[Tuple[np.ndarray, float]]" = Queue(maxsize=2)
@@ -812,6 +1372,40 @@ class HoloViewer(ABC):
         )
         server_thread.start()
         logger.info("WebSocket server thread started (port=%s); main thread running %s", port, "headless render loop" if headless else "render loop")
+        try:
+            if headless:
+                import signal
+                signal.signal(signal.SIGINT, lambda *a: stop_ev.set())
+                self._run_local_headless(
+                    frame_queue_for_stream=frame_queue,
+                    camera_command_queue=camera_command_queue,
+                    stop_ev=stop_ev,
+                )
+            else:
+                self._run_local(
+                    frame_queue_for_stream=frame_queue,
+                    yield_to_ws_thread=True,
+                    camera_command_queue=camera_command_queue,
+                )
+        finally:
+            stop_ev.set()
+
+    def _run_expose_socket(self, port: int, headless: bool = False) -> None:
+        """本地渲染 + WebSocket 推流（默认 socket 模式，H.264），视频与操控同一条连接，适合 SSH 隧道等。"""
+        if not _WS_AVAILABLE or not _STREAM_AVAILABLE or av is None:
+            raise RuntimeError("Socket mode (H.264) requires: pip install holoviewer[stream] (websockets, aiortc, av)")
+        if cv2 is None and not headless:
+            raise RuntimeError("OpenCV (cv2) is required for non-headless.")
+        frame_queue: "Queue[Tuple[np.ndarray, float]]" = Queue(maxsize=2)
+        camera_command_queue: "Queue[Tuple[np.ndarray, float, float]]" = Queue(maxsize=8)
+        stop_ev = threading.Event()
+        server_thread = threading.Thread(
+            target=_run_expose_server_socket,
+            args=(port, frame_queue, stop_ev, camera_command_queue, self),
+            daemon=True,
+        )
+        server_thread.start()
+        logger.info("WebSocket (socket) server thread started (port=%s); main thread running %s", port, "headless render loop" if headless else "render loop")
         try:
             if headless:
                 import signal
@@ -858,10 +1452,13 @@ class HoloViewer(ABC):
                     pass
                 if remote_cam is not None:
                     pos, yaw, pitch = remote_cam[0].astype(np.float64).copy(), remote_cam[1], remote_cam[2]
-                forward, right, up = self.axis_system.compute_camera_axes(yaw, pitch)
                 now = time.time()
                 dt = now - last
                 last = now
+                override = self.on_frame_camera_update(pos, yaw, pitch, dt)
+                if override is not None:
+                    pos, yaw, pitch = override[0], override[1], override[2]
+                forward, right, up = self.axis_system.compute_camera_axes(yaw, pitch)
                 if self.playing:
                     time_delta = self._compute_time_delta(dt)
                     self.sim_time = wrap_time(
@@ -974,10 +1571,14 @@ class HoloViewer(ABC):
         last = time.time()
         self._show_axes_flag = self.show_axes
         self.playing = True
+        self._fps_frame_count = 0
+        self._fps_time_accum = 0.0
+        self._fps_value = 0.0
 
         try:
             while True:
                 key = cv2.waitKey(1) & 0xFF
+                key_cv2 = key if key != 0xFF else None  # 0xFF = no key
                 try:
                     vis = cv2.getWindowProperty(
                         self.window_name, cv2.WND_PROP_VISIBLE
@@ -990,6 +1591,18 @@ class HoloViewer(ABC):
                     return
                 if key == 27:
                     break
+
+                # Invoke registered key handlers (edge-triggered)
+                for key_spec, callback in self._key_handlers:
+                    hk = _key_spec_hashable(key_spec)
+                    prev = self._key_handler_prev.get(hk, False)
+                    curr = _is_key_pressed(key_spec, key_cv2)
+                    self._key_handler_prev[hk] = curr
+            if curr and not prev:
+                try:
+                    callback()
+                except Exception:
+                    logger.exception("Key handler callback error")
 
                 now = time.time()
                 dt = now - last
@@ -1150,9 +1763,18 @@ class HoloViewer(ABC):
                 try:
                     _x, _y, w, h = cv2.getWindowImageRect(self.window_name)
                     if w > 0 and h > 0:
-                        self.width, self.height = w, h
+                        if w != self.width or h != self.height:
+                            if self.show_window_resize_log:
+                                print(f"🔄 Window resized: {w}x{h}")
+                            self.width, self.height = w, h
                 except Exception:
                     pass
+
+                # Subclass hook: override camera (e.g. auto camera movement)
+                override = self.on_frame_camera_update(pos, yaw, pitch, dt)
+                if override is not None:
+                    pos, yaw, pitch = override[0], override[1], override[2]
+                    forward, right, up = self.axis_system.compute_camera_axes(yaw, pitch)
 
                 (
                     view,
@@ -1172,8 +1794,31 @@ class HoloViewer(ABC):
                 img_bgr = to_uint8_bgr(image_tensor)
                 img_bgr = np.ascontiguousarray(img_bgr)
 
-                if self._show_axes_flag:
+                if self.should_draw_axes():
                     self.draw_world_axes(img_bgr, full)
+
+                self.on_frame_draw(img_bgr)
+
+                if self.show_fps:
+                    self._fps_frame_count += 1
+                    self._fps_time_accum += dt
+                    if self._fps_time_accum >= 1.0:
+                        self._fps_value = self._fps_frame_count / self._fps_time_accum
+                        self._fps_frame_count = 0
+                        self._fps_time_accum = 0.0
+                    fps_text = f"FPS: {self._fps_value:.1f}"
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.7
+                    thickness = 2
+                    color = (0, 255, 0)
+                    (tw, th), baseline = cv2.getTextSize(fps_text, font, font_scale, thickness)
+                    tx, ty = self.width - tw - 10, self.height - 10
+                    cv2.rectangle(img_bgr, (tx - 5, ty - th - 5), (tx + tw + 5, ty + baseline + 5), (0, 0, 0), -1)
+                    cv2.putText(img_bgr, fps_text, (tx, ty), font, font_scale, color, thickness)
+
+                suffix = self.get_window_title_suffix()
+                if suffix:
+                    cv2.setWindowTitle(self.window_name, self.window_name + suffix)
 
                 if frame_queue_for_stream is not None:
                     try:
@@ -1247,6 +1892,61 @@ class HoloViewer(ABC):
             _, right, up = self.axis_system.compute_camera_axes(yaw, pitch)
             pos -= right * float(input_dict.get("mouse_dx", 0)) * self.pan_sensitivity
             pos += up * float(input_dict.get("mouse_dy", 0)) * self.pan_sensitivity
+
+        # 订阅端同步：播放/时间/速度/坐标轴（边沿检测，避免每帧重复）
+        tab = input_dict.get("tab", 0)
+        if tab and not getattr(self, "_remote_prev_tab", False):
+            self.playing = not self.playing
+        self._remote_prev_tab = bool(tab)
+
+        plus = input_dict.get("plus", 0)
+        if plus and not getattr(self, "_remote_prev_plus", False):
+            self.play_rate = min(64.0, self.play_rate * 2.0)
+        self._remote_prev_plus = bool(plus)
+
+        minus = input_dict.get("minus", 0)
+        if minus and not getattr(self, "_remote_prev_minus", False):
+            self.play_rate = max(0.001, self.play_rate * 0.5)
+        self._remote_prev_minus = bool(minus)
+
+        bl = input_dict.get("bracket_left", 0)
+        if bl and not getattr(self, "_remote_prev_bracket_left", False):
+            self.adjust_time(-self.time_step)
+        self._remote_prev_bracket_left = bool(bl)
+
+        br = input_dict.get("bracket_right", 0)
+        if br and not getattr(self, "_remote_prev_bracket_right", False):
+            self.adjust_time(self.time_step)
+        self._remote_prev_bracket_right = bool(br)
+
+        qk = input_dict.get("q", 0)
+        if qk and not getattr(self, "_remote_prev_q", False):
+            self.adjust_time(-self.time_step)
+        self._remote_prev_q = bool(qk)
+
+        ek = input_dict.get("e", 0)
+        if ek and not getattr(self, "_remote_prev_e", False):
+            self.adjust_time(self.time_step)
+        self._remote_prev_e = bool(ek)
+
+        togg = input_dict.get("toggle_axes", 0)
+        if togg and not getattr(self, "_remote_prev_toggle_axes", False):
+            self._show_axes_flag = not self._show_axes_flag
+        self._remote_prev_toggle_axes = bool(togg)
+
+        # 注册的按键回调（边沿触发，与本地一致）
+        prev_custom = getattr(self, "_remote_prev_custom", None)
+        if prev_custom is None:
+            self._remote_prev_custom = {}
+        for i, (key_spec, callback) in enumerate(self._key_handlers):
+            curr = bool(input_dict.get(f"custom_{i}", 0))
+            prev = self._remote_prev_custom.get(i, False)
+            self._remote_prev_custom[i] = curr
+            if curr and not prev:
+                try:
+                    callback()
+                except Exception:
+                    logger.exception("Key handler callback error (remote)")
 
         return pos, yaw, pitch
 
