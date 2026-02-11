@@ -28,6 +28,9 @@ def _ensure_console_logging() -> None:
 import numpy as np
 import torch
 
+FramePacket = Tuple[np.ndarray, float, Optional[float]]
+CameraCommand = Tuple[np.ndarray, float, float, Optional[float]]
+
 try:
     import cv2  # type: ignore
 except Exception:  # pragma: no cover
@@ -401,9 +404,9 @@ def _draw_error_image(width: int, height: int, message: str, addr: str = "") -> 
 # --- WebRTC stream helpers (only used when _STREAM_AVAILABLE) ---
 def _run_expose_server(
     port: int,
-    frame_queue: "Queue[Tuple[np.ndarray, float]]",
+    frame_queue: "Queue[FramePacket]",
     stop_ev: threading.Event,
-    camera_command_queue: "Queue[Tuple[np.ndarray, float, float]]",
+    camera_command_queue: "Queue[CameraCommand]",
     viewer: "HoloViewer",
 ) -> None:
     if not _STREAM_AVAILABLE:
@@ -413,7 +416,7 @@ def _run_expose_server(
     class QueueVideoTrack(VideoStreamTrack):
         kind = "video"
 
-        def __init__(self, q: "Queue[Tuple[np.ndarray, float]]", stop: threading.Event) -> None:
+        def __init__(self, q: "Queue[FramePacket]", stop: threading.Event) -> None:
             super().__init__()
             self._queue = q
             self._stop = stop
@@ -422,7 +425,7 @@ def _run_expose_server(
         async def recv(self) -> Any:
             while not self._stop.is_set():
                 try:
-                    frame_bgr, _ = self._queue.get(timeout=0.5)
+                    frame_bgr, _, _ = self._queue.get(timeout=0.5)
                 except Empty:
                     continue
                 self._pts += 1
@@ -434,9 +437,9 @@ def _run_expose_server(
 
     async def _serve(
         ws_port: int,
-        q: "Queue[Tuple[np.ndarray, float]]",
+        q: "Queue[FramePacket]",
         stop: threading.Event,
-        cam_queue: "Queue[Tuple[np.ndarray, float, float]]",
+        cam_queue: "Queue[CameraCommand]",
         v: "HoloViewer",
     ) -> None:
         frame_track: Optional[QueueVideoTrack] = None
@@ -482,7 +485,7 @@ def _run_expose_server(
                                     pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
                                     remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
                                     try:
-                                        cam_queue.put_nowait((pos, yaw, pitch))
+                                        cam_queue.put_nowait((pos, yaw, pitch, None))
                                     except Exception:
                                         pass
                                 except Exception:
@@ -547,9 +550,9 @@ def _run_expose_server(
 
 def _run_expose_server_socket(
     port: int,
-    frame_queue: "Queue[Tuple[np.ndarray, float]]",
+    frame_queue: "Queue[FramePacket]",
     stop_ev: threading.Event,
-    camera_command_queue: "Queue[Tuple[np.ndarray, float, float]]",
+    camera_command_queue: "Queue[CameraCommand]",
     viewer: "HoloViewer",
 ) -> None:
     """WebSocket 纯 socket 模式：服务端经同一条连接发 H.264 帧、收 JSON 操控，无需 WebRTC/ICE。
@@ -563,9 +566,9 @@ def _run_expose_server_socket(
 
     async def _serve_socket(
         ws_port: int,
-        q: "Queue[Tuple[np.ndarray, float]]",
+        q: "Queue[FramePacket]",
         stop: threading.Event,
-        cam_queue: "Queue[Tuple[np.ndarray, float, float]]",
+        cam_queue: "Queue[CameraCommand]",
         v: "HoloViewer",
     ) -> None:
         remote_pos: Optional[np.ndarray] = None
@@ -597,8 +600,8 @@ def _run_expose_server_socket(
                 adaptive = {"bitrate_idx": 4, "scale_idx": 2}  # 初始最高质量
 
                 # 低延迟：只编码并发送最新一帧，丢弃积压的旧帧（last-frame-wins）
-                def _get_latest_frame() -> Optional[Tuple[np.ndarray, float]]:
-                    latest: Optional[Tuple[np.ndarray, float]] = None
+                def _get_latest_frame() -> Optional[FramePacket]:
+                    latest: Optional[FramePacket] = None
                     try:
                         latest = q.get(timeout=0.5)
                     except Empty:
@@ -618,12 +621,12 @@ def _run_expose_server_socket(
 
                 # 将编码移到专用线程，避免阻塞 asyncio 事件循环收控制消息。
                 def _encode_latest_frame(
-                    item: Tuple[np.ndarray, float],
+                    item: FramePacket,
                     bitrate_idx: int,
                     scale_idx: int,
                 ) -> bytes:
                     nonlocal codec, pts
-                    frame_bgr, _ = item
+                    frame_bgr, _, _ = item
                     h, w = frame_bgr.shape[:2]
                     scale = _SCALE_STEPS[scale_idx]
                     encode_w = max(64, int(w * scale))
@@ -675,6 +678,8 @@ def _run_expose_server_socket(
                                 adaptive["bitrate_idx"],
                                 adaptive["scale_idx"],
                             )
+                            if item[2] is not None:
+                                await websocket.send(json_mod.dumps({"type": "frame_meta", "input_ts": item[2]}))
                             if data:
                                 await websocket.send(data)
                         except Exception:
@@ -711,13 +716,15 @@ def _run_expose_server_socket(
                                 init_remote()
                                 pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
                                 remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                                input_ts_raw = recv_data.get("__input_ts")
+                                input_ts = float(input_ts_raw) if isinstance(input_ts_raw, (int, float)) else None
                                 try:
                                     while True:
                                         cam_queue.get_nowait()
                                 except Empty:
                                     pass
                                 try:
-                                    cam_queue.put_nowait((pos, yaw, pitch))
+                                    cam_queue.put_nowait((pos, yaw, pitch, input_ts))
                                 except Exception:
                                     pass
                         except asyncio.TimeoutError:
@@ -1002,14 +1009,18 @@ def _run_scribe_client_socket(
                 # 用于自适应画质：统计丢帧/收帧，定期上报服务端（类似 WebRTC REMB 反馈）
                 stats = [0, 0]  # [dropped, received]
 
-                def decode_and_put(msg: bytes) -> None:
+                pending_input_ts: Optional[float] = None
+
+                def decode_and_put(msg: bytes, input_ts: Optional[float]) -> bool:
                     if not msg:
-                        return
+                        return False
+                    produced = False
                     try:
                         packet = av.Packet(msg)
                         packet.pts = 0
                         packet.time_base = time_base
                         for frame in decoder.decode(packet):
+                            produced = True
                             arr = frame.to_ndarray(format="bgr24")
                             try:
                                 # 低延迟：只保留最新一帧，丢弃积压的旧帧
@@ -1020,20 +1031,31 @@ def _run_scribe_client_socket(
                                         dropped += 1
                                     except Exception:
                                         break
-                                frame_queue.put_nowait(arr)
+                                frame_queue.put_nowait(("frame", arr, input_ts))
                                 stats[0] += dropped
                                 stats[1] += 1
                             except Exception:
                                 pass
                     except Exception:
                         pass
+                    return produced
 
                 async def recv_frames() -> None:
+                    nonlocal pending_input_ts
                     while not stop_ev.is_set():
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
                             if isinstance(msg, bytes):
-                                decode_and_put(msg)
+                                if decode_and_put(msg, pending_input_ts):
+                                    pending_input_ts = None
+                            elif isinstance(msg, str):
+                                try:
+                                    data = json_mod.loads(msg)
+                                    if data.get("type") == "frame_meta":
+                                        raw_ts = data.get("input_ts")
+                                        pending_input_ts = float(raw_ts) if isinstance(raw_ts, (int, float)) else None
+                                except Exception:
+                                    pass
                         except asyncio.TimeoutError:
                             continue
                         except Exception:
@@ -1241,6 +1263,12 @@ class HoloViewer(ABC):
         last_img: Optional[np.ndarray] = None
         error_msg: Optional[str] = None
         disconnected = False
+        latest_m2p_ms: Optional[float] = None
+        smoothed_m2p_ms: Optional[float] = None
+        displayed_m2p_ms: Optional[float] = None
+        m2p_ema_alpha = 0.08
+        m2p_display_update_interval_s = 0.20
+        last_m2p_display_update_ts = 0.0
         self._dragging = False
         self._pan_dragging = False
         self._left_dragging = False
@@ -1336,6 +1364,7 @@ class HoloViewer(ABC):
                     "tab": tab, "plus": plus, "minus": minus,
                     "bracket_left": bracket_left, "bracket_right": bracket_right,
                     "q": q, "e": e, "toggle_axes": toggle_axes,
+                    "__input_ts": time.perf_counter(),
                 }
                 for i, (key_spec, _) in enumerate(self._key_handlers):
                     inp[f"custom_{i}"] = 1 if _is_key_pressed(key_spec, key_cv2) else 0
@@ -1361,6 +1390,19 @@ class HoloViewer(ABC):
                     if isinstance(item, tuple) and len(item) == 2 and item[0] == "error":
                         error_msg = item[1]
                         stop_ev.set()
+                    elif isinstance(item, tuple) and len(item) == 3 and item[0] == "frame":
+                        if isinstance(item[1], np.ndarray):
+                            last_img = item[1]
+                            input_ts = item[2]
+                            if isinstance(input_ts, (int, float)):
+                                latest_m2p_ms = max(0.0, (time.perf_counter() - float(input_ts)) * 1000.0)
+                                if smoothed_m2p_ms is None:
+                                    smoothed_m2p_ms = latest_m2p_ms
+                                else:
+                                    smoothed_m2p_ms = (
+                                        (1.0 - m2p_ema_alpha) * smoothed_m2p_ms
+                                        + m2p_ema_alpha * latest_m2p_ms
+                                    )
                     elif isinstance(item, np.ndarray):
                         last_img = item
                     else:
@@ -1377,7 +1419,44 @@ class HoloViewer(ABC):
                     cv2.imshow(self.window_name, show_img)
                     continue
                 if last_img is not None:
-                    cv2.imshow(self.window_name, last_img)
+                    show_img = last_img
+                    # Keep display resolution in sync with current window size.
+                    # Draw overlays after resize so text size stays visually stable.
+                    try:
+                        _x, _y, win_w, win_h = cv2.getWindowImageRect(self.window_name)
+                        if win_w > 0 and win_h > 0:
+                            self.width, self.height = int(win_w), int(win_h)
+                    except Exception:
+                        pass
+                    if getattr(show_img, "ndim", 0) >= 2:
+                        src_h, src_w = int(show_img.shape[0]), int(show_img.shape[1])
+                        dst_w, dst_h = int(self.width), int(self.height)
+                        if src_w > 0 and src_h > 0 and dst_w > 0 and dst_h > 0 and (src_w != dst_w or src_h != dst_h):
+                            interp = cv2.INTER_AREA if (src_w > dst_w or src_h > dst_h) else cv2.INTER_LINEAR
+                            show_img = cv2.resize(show_img, (dst_w, dst_h), interpolation=interp)
+                    if latest_m2p_ms is not None:
+                        show_img = show_img.copy()
+                        now_ts = time.perf_counter()
+                        shown_m2p_ms = smoothed_m2p_ms if smoothed_m2p_ms is not None else latest_m2p_ms
+                        if (
+                            displayed_m2p_ms is None
+                            or (now_ts - last_m2p_display_update_ts) >= m2p_display_update_interval_s
+                        ):
+                            displayed_m2p_ms = shown_m2p_ms
+                            last_m2p_display_update_ts = now_ts
+                        label = f"M2P: {displayed_m2p_ms:.1f} ms"
+                        img_h = int(show_img.shape[0]) if getattr(show_img, "ndim", 0) >= 2 else self.height
+                        cv2.putText(
+                            show_img,
+                            label,
+                            (10, max(20, img_h - 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            (180, 255, 180),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                    cv2.imshow(self.window_name, show_img)
         finally:
             stop_ev.set()
             try:
@@ -1408,8 +1487,8 @@ class HoloViewer(ABC):
         """本地渲染 + WebRTC 服务（--webrtc；适合局域网）。"""
         if not _STREAM_AVAILABLE:
             raise RuntimeError("Expose mode requires: pip install holoviewer[stream] (websockets, aiortc, av)")
-        frame_queue: "Queue[Tuple[np.ndarray, float]]" = Queue(maxsize=2)
-        camera_command_queue: "Queue[Tuple[np.ndarray, float, float]]" = Queue(maxsize=8)
+        frame_queue: "Queue[FramePacket]" = Queue(maxsize=2)
+        camera_command_queue: "Queue[CameraCommand]" = Queue(maxsize=8)
         stop_ev = threading.Event()
         server_thread = threading.Thread(
             target=_run_expose_server,
@@ -1442,8 +1521,8 @@ class HoloViewer(ABC):
             raise RuntimeError("Socket mode (H.264) requires: pip install holoviewer[stream] (websockets, aiortc, av)")
         if cv2 is None and not headless:
             raise RuntimeError("OpenCV (cv2) is required for non-headless.")
-        frame_queue: "Queue[Tuple[np.ndarray, float]]" = Queue(maxsize=2)
-        camera_command_queue: "Queue[Tuple[np.ndarray, float, float]]" = Queue(maxsize=8)
+        frame_queue: "Queue[FramePacket]" = Queue(maxsize=2)
+        camera_command_queue: "Queue[CameraCommand]" = Queue(maxsize=8)
         stop_ev = threading.Event()
         server_thread = threading.Thread(
             target=_run_expose_server_socket,
@@ -1472,8 +1551,8 @@ class HoloViewer(ABC):
 
     def _run_local_headless(
         self,
-        frame_queue_for_stream: "Queue[Tuple[np.ndarray, float]]",
-        camera_command_queue: "Queue[Tuple[np.ndarray, float, float]]",
+        frame_queue_for_stream: "Queue[FramePacket]",
+        camera_command_queue: "Queue[CameraCommand]",
         stop_ev: threading.Event,
     ) -> None:
         """无窗口渲染循环：仅跑渲染管线并向 frame_queue 推帧，相机由 camera_command_queue 驱动（订阅端控制）；无 cv2。"""
@@ -1488,16 +1567,23 @@ class HoloViewer(ABC):
         last = time.time()
         self._show_axes_flag = self.show_axes
         self.playing = True
+        last_frame_input_ts: Optional[float] = None
         try:
             while not stop_ev.is_set():
-                remote_cam: Optional[Tuple[np.ndarray, float, float]] = None
+                remote_cam: Optional[CameraCommand] = None
                 try:
                     while True:
                         remote_cam = camera_command_queue.get_nowait()
                 except Empty:
                     pass
+                frame_input_ts: Optional[float] = None
                 if remote_cam is not None:
                     pos, yaw, pitch = remote_cam[0].astype(np.float64).copy(), remote_cam[1], remote_cam[2]
+                    frame_input_ts = remote_cam[3]
+                    if isinstance(frame_input_ts, (int, float)):
+                        last_frame_input_ts = float(frame_input_ts)
+                if frame_input_ts is None:
+                    frame_input_ts = last_frame_input_ts
                 now = time.time()
                 dt = now - last
                 last = now
@@ -1529,7 +1615,7 @@ class HoloViewer(ABC):
                 if self._show_axes_flag:
                     self.draw_world_axes(img_bgr, full)
                 try:
-                    frame_queue_for_stream.put_nowait((img_bgr.copy(), self.sim_time))
+                    frame_queue_for_stream.put_nowait((img_bgr.copy(), self.sim_time, frame_input_ts))
                 except Exception:
                     pass
                 time.sleep(0.001)
@@ -1538,9 +1624,9 @@ class HoloViewer(ABC):
 
     def _run_local(
         self,
-        frame_queue_for_stream: Optional["Queue[Tuple[np.ndarray, float]]"] = None,
+        frame_queue_for_stream: Optional["Queue[FramePacket]"] = None,
         yield_to_ws_thread: bool = False,
-        camera_command_queue: Optional["Queue[Tuple[np.ndarray, float, float]]"] = None,
+        camera_command_queue: Optional["Queue[CameraCommand]"] = None,
     ) -> None:
         """主循环：本地渲染、相机控制、显示。若提供 frame_queue_for_stream 则每帧推入队列（expose 模式）。
         yield_to_ws_thread=True 时每帧 sleep(0.001) 以让出 CPU 给 WebSocket 服务线程（macOS 上 OpenCV 须在主线程）。
@@ -1620,6 +1706,7 @@ class HoloViewer(ABC):
         self._fps_frame_count = 0
         self._fps_time_accum = 0.0
         self._fps_value = 0.0
+        last_frame_input_ts: Optional[float] = None
 
         try:
             while True:
@@ -1644,11 +1731,11 @@ class HoloViewer(ABC):
                     prev = self._key_handler_prev.get(hk, False)
                     curr = _is_key_pressed(key_spec, key_cv2)
                     self._key_handler_prev[hk] = curr
-            if curr and not prev:
-                try:
-                    callback()
-                except Exception:
-                    logger.exception("Key handler callback error")
+                    if curr and not prev:
+                        try:
+                            callback()
+                        except Exception:
+                            logger.exception("Key handler callback error")
 
                 now = time.time()
                 dt = now - last
@@ -1660,8 +1747,9 @@ class HoloViewer(ABC):
                     )
 
                 use_remote_camera = False
+                frame_input_ts: Optional[float] = None
                 if camera_command_queue is not None:
-                    remote_cam: Optional[Tuple[np.ndarray, float, float]] = None
+                    remote_cam: Optional[CameraCommand] = None
                     try:
                         while True:
                             remote_cam = camera_command_queue.get_nowait()
@@ -1669,7 +1757,12 @@ class HoloViewer(ABC):
                         pass
                     if remote_cam is not None:
                         pos, yaw, pitch = remote_cam[0].astype(np.float64).copy(), remote_cam[1], remote_cam[2]
+                        frame_input_ts = remote_cam[3]
+                        if isinstance(frame_input_ts, (int, float)):
+                            last_frame_input_ts = float(frame_input_ts)
                         use_remote_camera = True
+                if frame_input_ts is None:
+                    frame_input_ts = last_frame_input_ts
 
                 move = np.zeros(3, dtype=np.float64)
                 speed = self.move_speed
@@ -1868,7 +1961,7 @@ class HoloViewer(ABC):
 
                 if frame_queue_for_stream is not None:
                     try:
-                        frame_queue_for_stream.put_nowait((img_bgr.copy(), self.sim_time))
+                        frame_queue_for_stream.put_nowait((img_bgr.copy(), self.sim_time, frame_input_ts))
                     except Exception:
                         pass
                 cv2.imshow(self.window_name, img_bgr)
