@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import concurrent.futures
 import fractions
 import logging
 import math
@@ -585,6 +586,7 @@ def _run_expose_server_socket(
             nonlocal remote_pos, remote_yaw, remote_pitch
             peer = getattr(websocket, "remote_address", None) or "unknown"
             logger.info("Client connected (WebSocket socket mode), peer=%s", peer)
+            encode_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
                 await websocket.send(json_mod.dumps({"type": "tunnel", "version": 1, "codec": "h264"}))
                 loop = asyncio.get_running_loop()
@@ -610,53 +612,69 @@ def _run_expose_server_socket(
 
                 # 周期性关键帧（每 KEYFRAME_INTERVAL 帧一个 I 帧，便于恢复与限时延）
                 _KEYFRAME_INTERVAL = 30  # 约 1 秒 @ 30fps
+                codec: Optional[Any] = None
+                pts = 0
+                time_base = fractions.Fraction(1, 30)
+
+                # 将编码移到专用线程，避免阻塞 asyncio 事件循环收控制消息。
+                def _encode_latest_frame(
+                    item: Tuple[np.ndarray, float],
+                    bitrate_idx: int,
+                    scale_idx: int,
+                ) -> bytes:
+                    nonlocal codec, pts
+                    frame_bgr, _ = item
+                    h, w = frame_bgr.shape[:2]
+                    scale = _SCALE_STEPS[scale_idx]
+                    encode_w = max(64, int(w * scale))
+                    encode_h = max(64, int(h * scale))
+                    if scale < 1.0 and cv2 is not None:
+                        frame_bgr = cv2.resize(frame_bgr, (encode_w, encode_h), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        encode_w, encode_h = w, h
+                    bitrate = _BITRATE_STEPS[bitrate_idx]
+                    if codec is None or codec.width != encode_w or codec.height != encode_h:
+                        codec = av.CodecContext.create("libx264", "w")
+                        codec.width = encode_w
+                        codec.height = encode_h
+                        codec.pix_fmt = "yuv420p"
+                        codec.time_base = time_base
+                        codec.framerate = fractions.Fraction(30, 1)
+                        codec.bit_rate = bitrate
+                        codec.options = {
+                            "tune": "zerolatency",
+                            "level": "31",
+                            "rc_lookahead": "0",  # 禁用 lookahead，降低编码延迟
+                        }
+                        codec.profile = "baseline"
+                    if codec.bit_rate != bitrate:
+                        codec.bit_rate = bitrate
+                    pts += 1
+                    av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
+                    av_frame.pts = pts
+                    av_frame.time_base = time_base
+                    if pts == 1 or (pts % _KEYFRAME_INTERVAL) == 1:
+                        av_frame.pict_type = av.video.frame.PictureType.I
+                    else:
+                        av_frame.pict_type = av.video.frame.PictureType.NONE
+                    data = b""
+                    for packet in codec.encode(av_frame):
+                        data += bytes(packet)
+                    return data
 
                 async def send_frames() -> None:
-                    codec: Optional[Any] = None
-                    pts = 0
-                    time_base = fractions.Fraction(1, 30)
                     while not stop.is_set():
                         try:
                             item = await loop.run_in_executor(None, _get_latest_frame)
                             if item is None:
                                 continue
-                            frame_bgr, _ = item
-                            h, w = frame_bgr.shape[:2]
-                            scale = _SCALE_STEPS[adaptive["scale_idx"]]
-                            encode_w = max(64, int(w * scale))
-                            encode_h = max(64, int(h * scale))
-                            if scale < 1.0 and cv2 is not None:
-                                frame_bgr = cv2.resize(frame_bgr, (encode_w, encode_h), interpolation=cv2.INTER_LINEAR)
-                            else:
-                                encode_w, encode_h = w, h
-                            bitrate = _BITRATE_STEPS[adaptive["bitrate_idx"]]
-                            if codec is None or codec.width != encode_w or codec.height != encode_h:
-                                codec = av.CodecContext.create("libx264", "w")
-                                codec.width = encode_w
-                                codec.height = encode_h
-                                codec.pix_fmt = "yuv420p"
-                                codec.time_base = time_base
-                                codec.framerate = time_base
-                                codec.bit_rate = bitrate
-                                codec.options = {
-                                    "tune": "zerolatency",
-                                    "level": "31",
-                                    "rc_lookahead": "0",  # 禁用 lookahead，降低编码延迟
-                                }
-                                codec.profile = "baseline"
-                            if codec.bit_rate != bitrate:
-                                codec.bit_rate = bitrate
-                            pts += 1
-                            av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
-                            av_frame.pts = pts
-                            av_frame.time_base = time_base
-                            if pts == 1 or (pts % _KEYFRAME_INTERVAL) == 1:
-                                av_frame.pict_type = av.video.frame.PictureType.I
-                            else:
-                                av_frame.pict_type = av.video.frame.PictureType.NONE
-                            data = b""
-                            for packet in codec.encode(av_frame):
-                                data += bytes(packet)
+                            data = await loop.run_in_executor(
+                                encode_executor,
+                                _encode_latest_frame,
+                                item,
+                                adaptive["bitrate_idx"],
+                                adaptive["scale_idx"],
+                            )
                             if data:
                                 await websocket.send(data)
                         except Exception:
@@ -694,6 +712,11 @@ def _run_expose_server_socket(
                                 pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
                                 remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
                                 try:
+                                    while True:
+                                        cam_queue.get_nowait()
+                                except Empty:
+                                    pass
+                                try:
                                     cam_queue.put_nowait((pos, yaw, pitch))
                                 except Exception:
                                     pass
@@ -706,10 +729,20 @@ def _run_expose_server_socket(
             except Exception as e:
                 logger.warning("Socket handler error: %s", e)
             finally:
+                encode_executor.shutdown(wait=False)
                 logger.info("Client disconnected (peer=%s)", peer)
 
         logger.info("WebSocket (socket) server binding to 0.0.0.0:%s ...", ws_port)
-        async with websockets.serve(handler, "0.0.0.0", ws_port, ping_interval=None, ping_timeout=None, close_timeout=1):  # type: ignore
+        async with websockets.serve(
+            handler,
+            "0.0.0.0",
+            ws_port,
+            ping_interval=None,
+            ping_timeout=None,
+            close_timeout=1,
+            compression=None,
+            max_queue=1,
+        ):  # type: ignore
             logger.info("Socket mode ready. Subscribe: --subscribe 127.0.0.1:%s or <this-ip>:%s", ws_port, ws_port)
             await asyncio.get_event_loop().run_in_executor(None, stop.wait)
 
@@ -945,7 +978,15 @@ def _run_scribe_client_socket(
 
     async def _client() -> None:
         try:
-            async with websockets.connect(uri, ping_interval=None, ping_timeout=None, close_timeout=2, open_timeout=connect_timeout) as ws:  # type: ignore
+            async with websockets.connect(
+                uri,
+                ping_interval=None,
+                ping_timeout=None,
+                close_timeout=2,
+                open_timeout=connect_timeout,
+                compression=None,
+                max_queue=1,
+            ) as ws:  # type: ignore
                 first = await asyncio.wait_for(ws.recv(), timeout=5.0)
                 if isinstance(first, str):
                     data = json_mod.loads(first)
@@ -1298,6 +1339,11 @@ class HoloViewer(ABC):
                 }
                 for i, (key_spec, _) in enumerate(self._key_handlers):
                     inp[f"custom_{i}"] = 1 if _is_key_pressed(key_spec, key_cv2) else 0
+                try:
+                    while True:
+                        camera_send_queue.get_nowait()
+                except Empty:
+                    pass
                 try:
                     camera_send_queue.put_nowait(inp)
                 except Exception:
