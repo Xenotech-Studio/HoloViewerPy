@@ -92,6 +92,8 @@ _VK_OEM_PLUS = 0xBB   # + =
 _VK_OEM_MINUS = 0xBD  # - _
 _VK_OEM_4 = 0xDB     # [
 _VK_OEM_6 = 0xDD     # ]
+_VK_9 = 0x39         # 9 (FOV zoom out)
+_VK_0 = 0x30         # 0 (FOV zoom in)
 _VK_LEFT = 0x25
 _VK_UP = 0x26
 _VK_RIGHT = 0x27
@@ -131,6 +133,8 @@ if sys.platform == "darwin":  # pragma: no cover - platform specific
         _kVK_ANSI_Grave = 0x32
         _kVK_ANSI_LeftBracket = 0x21
         _kVK_ANSI_RightBracket = 0x1E
+        _kVK_ANSI_9 = 0x19
+        _kVK_ANSI_0 = 0x1D
         _kVK_ANSI_Minus = 0x1B
         _kVK_ANSI_Equal = 0x18
         _kVK_Shift = 0x38
@@ -156,6 +160,8 @@ if sys.platform == "darwin":  # pragma: no cover - platform specific
             "grave": _kVK_ANSI_Grave,
             "bracket_left": _kVK_ANSI_LeftBracket,
             "bracket_right": _kVK_ANSI_RightBracket,
+            "nine": _kVK_ANSI_9,
+            "zero": _kVK_ANSI_0,
             "minus": _kVK_ANSI_Minus,
             "plus": _kVK_ANSI_Equal,
             "shift": _kVK_Shift,
@@ -201,6 +207,17 @@ _KEY_MAP: Dict[str, Tuple[Optional[int], Optional[str], List[int]]] = {
 
 # 类型：key_spec 可为 int(VK)、str(名称)、或 (vk, mac_name, cv2_keys) 元组
 KeySpec = Union[int, str, Tuple[Optional[int], Optional[str], List[int]]]
+
+
+def _key_spec_display(key_spec: KeySpec) -> str:
+    """返回 key_spec 的可读名称，用于日志。"""
+    if isinstance(key_spec, str):
+        return key_spec
+    if isinstance(key_spec, tuple) and len(key_spec) >= 2 and key_spec[1]:
+        return str(key_spec[1])
+    if isinstance(key_spec, int):
+        return f"0x{key_spec:X}"
+    return "key"
 
 
 def _key_spec_hashable(key_spec: KeySpec) -> Union[int, str, Tuple[Optional[int], Optional[str], Tuple[int, ...]]]:
@@ -1273,6 +1290,11 @@ class HoloViewer(ABC):
         self._pan_dragging = False
         self._left_dragging = False
         mouse_delta: List[float] = [0.0, 0.0]
+        prev_nine = False
+        prev_zero = False
+        prev_plus = False
+        prev_minus = False
+        prev_custom: Dict[int, bool] = {}
 
         def on_mouse_scribe(event: int, x: int, y: int, flags: int, param: Any) -> None:
             if event == cv2.EVENT_LBUTTONDOWN:
@@ -1310,7 +1332,7 @@ class HoloViewer(ABC):
                     break
                 w = a = s = d = space = shift = alt = 0
                 left = right = up = down = 0
-                tab = plus = minus = bracket_left = bracket_right = q = e = toggle_axes = 0
+                tab = plus = minus = bracket_left = bracket_right = q = e = toggle_axes = nine = zero = 0
                 if _win_key is not None:
                     w = 1 if (_win_key.GetAsyncKeyState(_VK_W) & 0x8000) else 0
                     a = 1 if (_win_key.GetAsyncKeyState(_VK_A) & 0x8000) else 0
@@ -1331,6 +1353,8 @@ class HoloViewer(ABC):
                     q = 1 if (_win_key.GetAsyncKeyState(_VK_Q) & 0x8000) else 0
                     e = 1 if (_win_key.GetAsyncKeyState(_VK_E) & 0x8000) else 0
                     toggle_axes = 1 if (_win_key.GetAsyncKeyState(_VK_OEM3) & 0x8000) else 0
+                    nine = 1 if (_win_key.GetAsyncKeyState(_VK_9) & 0x8000) else 0
+                    zero = 1 if (_win_key.GetAsyncKeyState(_VK_0) & 0x8000) else 0
                 elif _mac_key is not None:
                     w = 1 if _mac_key("w") else 0
                     a = 1 if _mac_key("a") else 0
@@ -1351,6 +1375,29 @@ class HoloViewer(ABC):
                     q = 1 if _mac_key("q") else 0
                     e = 1 if _mac_key("e") else 0
                     toggle_axes = 1 if _mac_key("grave") else 0
+                    nine = 1 if _mac_key("nine") else 0
+                    zero = 1 if _mac_key("zero") else 0
+                else:
+                    nine = 1 if (key != 255 and key == ord("9")) else 0
+                    zero = 1 if (key != 255 and key == ord("0")) else 0
+                    plus = 1 if (key != 255 and (key == ord("+") or key == ord("="))) else 0
+                    minus = 1 if (key != 255 and (key == ord("-") or key == ord("_"))) else 0
+                if nine and not prev_nine:
+                    sys.stderr.write("🔍 FOV: 9 pressed (zoom out)\n")
+                    sys.stderr.flush()
+                if zero and not prev_zero:
+                    sys.stderr.write("🔍 FOV: 0 pressed (zoom in)\n")
+                    sys.stderr.flush()
+                if plus and not prev_plus:
+                    sys.stderr.write("⏩ Play rate: + pressed\n")
+                    sys.stderr.flush()
+                if minus and not prev_minus:
+                    sys.stderr.write("⏪ Play rate: - pressed\n")
+                    sys.stderr.flush()
+                prev_nine = bool(nine)
+                prev_zero = bool(zero)
+                prev_plus = bool(plus)
+                prev_minus = bool(minus)
                 dx, dy = mouse_delta[0], mouse_delta[1]
                 mouse_delta[0], mouse_delta[1] = 0.0, 0.0
                 key_cv2 = key if key != 255 else None
@@ -1364,10 +1411,17 @@ class HoloViewer(ABC):
                     "tab": tab, "plus": plus, "minus": minus,
                     "bracket_left": bracket_left, "bracket_right": bracket_right,
                     "q": q, "e": e, "toggle_axes": toggle_axes,
+                    "nine": nine, "zero": zero,
                     "__input_ts": time.perf_counter(),
                 }
                 for i, (key_spec, _) in enumerate(self._key_handlers):
-                    inp[f"custom_{i}"] = 1 if _is_key_pressed(key_spec, key_cv2) else 0
+                    curr = 1 if _is_key_pressed(key_spec, key_cv2) else 0
+                    inp[f"custom_{i}"] = curr
+                    if curr and not prev_custom.get(i, False):
+                        key_name = _key_spec_display(key_spec)
+                        sys.stderr.write(f"⌨️ Key pressed (client): {key_name}\n")
+                        sys.stderr.flush()
+                    prev_custom[i] = bool(curr)
                 try:
                     while True:
                         camera_send_queue.get_nowait()
@@ -1614,6 +1668,7 @@ class HoloViewer(ABC):
                 img_bgr = np.ascontiguousarray(img_bgr)
                 if self._show_axes_flag:
                     self.draw_world_axes(img_bgr, full)
+                self.on_frame_draw(img_bgr)
                 try:
                     frame_queue_for_stream.put_nowait((img_bgr.copy(), self.sim_time, frame_input_ts))
                 except Exception:
@@ -1732,6 +1787,8 @@ class HoloViewer(ABC):
                     curr = _is_key_pressed(key_spec, key_cv2)
                     self._key_handler_prev[hk] = curr
                     if curr and not prev:
+                        key_name = _key_spec_display(key_spec)
+                        print(f"⌨️ Key pressed: {key_name}", flush=True)
                         try:
                             callback()
                         except Exception:
@@ -1867,14 +1924,28 @@ class HoloViewer(ABC):
                             if key == 9:
                                 self.playing = not self.playing
 
-                        if key == ord("+") or key == ord("="):
+                        plus_down = (key == ord("+") or key == ord("=")) or (_win_key is not None and (_win_key.GetAsyncKeyState(_VK_OEM_PLUS) & 0x8000)) or (_mac_key is not None and _mac_key("plus"))
+                        minus_down = (key == ord("-") or key == ord("_")) or (_win_key is not None and (_win_key.GetAsyncKeyState(_VK_OEM_MINUS) & 0x8000)) or (_mac_key is not None and _mac_key("minus"))
+                        if plus_down:
+                            old_rate = self.play_rate
                             self.play_rate = min(64.0, self.play_rate * 2.0)
-                        if key == ord("-") or key == ord("_"):
+                            if self.play_rate != old_rate:
+                                print(f"⏩ Play rate: {self.play_rate:.2f}x (+)", flush=True)
+                        if minus_down:
+                            old_rate = self.play_rate
                             self.play_rate = max(0.001, self.play_rate * 0.5)
-                        if key == ord("9"):
+                            if self.play_rate != old_rate:
+                                print(f"⏪ Play rate: {self.play_rate:.2f}x (-)", flush=True)
+                        nine_down = (key == ord("9")) or (_win_key is not None and (_win_key.GetAsyncKeyState(_VK_9) & 0x8000)) or (_mac_key is not None and _mac_key("nine"))
+                        zero_down = (key == ord("0")) or (_win_key is not None and (_win_key.GetAsyncKeyState(_VK_0) & 0x8000)) or (_mac_key is not None and _mac_key("zero"))
+                        if nine_down and not getattr(self, "_prev_nine", False):
                             self.fov_y_deg = max(5.0, min(120.0, self.fov_y_deg * 0.9))
-                        if key == ord("0"):
+                            print(f"🔍 FOV: {self.fov_y_deg:.1f}° (9 zoom out)", flush=True)
+                        self._prev_nine = bool(nine_down)
+                        if zero_down and not getattr(self, "_prev_zero", False):
                             self.fov_y_deg = max(5.0, min(120.0, self.fov_y_deg * 1.1))
+                            print(f"🔍 FOV: {self.fov_y_deg:.1f}° (0 zoom in)", flush=True)
+                        self._prev_zero = bool(zero_down)
                         if key == ord("["):
                             self.adjust_time(-self.time_step)
                         if key == ord("]"):
@@ -2040,12 +2111,18 @@ class HoloViewer(ABC):
 
         plus = input_dict.get("plus", 0)
         if plus and not getattr(self, "_remote_prev_plus", False):
+            old_rate = self.play_rate
             self.play_rate = min(64.0, self.play_rate * 2.0)
+            if self.play_rate != old_rate:
+                print(f"⏩ Play rate: {self.play_rate:.2f}x (+)", flush=True)
         self._remote_prev_plus = bool(plus)
 
         minus = input_dict.get("minus", 0)
         if minus and not getattr(self, "_remote_prev_minus", False):
+            old_rate = self.play_rate
             self.play_rate = max(0.001, self.play_rate * 0.5)
+            if self.play_rate != old_rate:
+                print(f"⏪ Play rate: {self.play_rate:.2f}x (-)", flush=True)
         self._remote_prev_minus = bool(minus)
 
         bl = input_dict.get("bracket_left", 0)
@@ -2073,6 +2150,17 @@ class HoloViewer(ABC):
             self._show_axes_flag = not self._show_axes_flag
         self._remote_prev_toggle_axes = bool(togg)
 
+        nine = input_dict.get("nine", 0)
+        if nine and not getattr(self, "_remote_prev_nine", False):
+            self.fov_y_deg = max(5.0, min(120.0, self.fov_y_deg * 0.9))
+            print(f"🔍 FOV: {self.fov_y_deg:.1f}° (9 zoom out)", flush=True)
+        self._remote_prev_nine = bool(nine)
+        zero = input_dict.get("zero", 0)
+        if zero and not getattr(self, "_remote_prev_zero", False):
+            self.fov_y_deg = max(5.0, min(120.0, self.fov_y_deg * 1.1))
+            print(f"🔍 FOV: {self.fov_y_deg:.1f}° (0 zoom in)", flush=True)
+        self._remote_prev_zero = bool(zero)
+
         # 注册的按键回调（边沿触发，与本地一致）
         prev_custom = getattr(self, "_remote_prev_custom", None)
         if prev_custom is None:
@@ -2082,6 +2170,8 @@ class HoloViewer(ABC):
             prev = self._remote_prev_custom.get(i, False)
             self._remote_prev_custom[i] = curr
             if curr and not prev:
+                key_name = _key_spec_display(key_spec)
+                print(f"⌨️ Key pressed (remote): {key_name}", flush=True)
                 try:
                     callback()
                 except Exception:
