@@ -371,8 +371,8 @@ def to_uint8_bgr(image_tensor: torch.Tensor) -> np.ndarray:
     return img[:, :, ::-1]
 
 
-def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool, bool]:
-    """Parse --expose-port、--scribe、--subscribe、--headless、--webrtc from argv. Returns (expose_port, scribe_addr, headless, use_webrtc)."""
+def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool, bool, bool]:
+    """Parse --expose-port、--scribe、--subscribe、--headless、--webrtc、--no-compress from argv. Returns (expose_port, scribe_addr, headless, use_webrtc, no_compress)."""
     if argv is None:
         argv = sys.argv[1:]
     parser = argparse.ArgumentParser()
@@ -381,17 +381,18 @@ def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int],
     parser.add_argument("--subscribe", type=str, default=None, metavar="HOST:PORT or PORT", help="Same as --scribe; if only PORT, use 127.0.0.1:PORT")
     parser.add_argument("--headless", action="store_true", help="No cv2 window; use with --expose-port to run server and render pipeline only.")
     parser.add_argument("--webrtc", action="store_true", help="Use WebRTC for streaming (LAN only without TURN); default is WebSocket/socket mode for cross-network (e.g. SSH tunnel)")
+    parser.add_argument("--no-compress", action="store_true", help="Disable adaptive quality; keep max bitrate and resolution regardless of network (server only)")
     args, _ = parser.parse_known_args(argv)
     expose_port = args.expose_port
     scribe_addr = args.scribe or args.subscribe
     if scribe_addr and ":" not in scribe_addr:
         scribe_addr = "127.0.0.1:" + scribe_addr
-    return expose_port, scribe_addr, getattr(args, "headless", False), getattr(args, "webrtc", False)
+    return expose_port, scribe_addr, getattr(args, "headless", False), getattr(args, "webrtc", False), getattr(args, "no_compress", False)
 
 
 def is_client(argv: Optional[List[str]] = None) -> bool:
     """True 表示当前为订阅端（--scribe/--subscribe），仅收流不渲染，可据此延迟导入仅服务端需要的包。"""
-    _, scribe_addr, _, _ = parse_network_args(argv)
+    _, scribe_addr, _, _, _ = parse_network_args(argv)
     return scribe_addr is not None
 
 
@@ -571,6 +572,7 @@ def _run_expose_server_socket(
     stop_ev: threading.Event,
     camera_command_queue: "Queue[CameraCommand]",
     viewer: "HoloViewer",
+    no_compress: bool = False,
 ) -> None:
     """WebSocket 纯 socket 模式：服务端经同一条连接发 H.264 帧、收 JSON 操控，无需 WebRTC/ICE。
     低延迟：只发最新帧、周期性 I 帧、rc_lookahead=0。自适应画质：根据客户端 stats 反馈调节码率与分辨率。"""
@@ -587,6 +589,7 @@ def _run_expose_server_socket(
         stop: threading.Event,
         cam_queue: "Queue[CameraCommand]",
         v: "HoloViewer",
+        no_compress: bool = False,
     ) -> None:
         remote_pos: Optional[np.ndarray] = None
         remote_yaw: Optional[float] = None
@@ -711,24 +714,25 @@ def _run_expose_server_socket(
                                 recv_data = json_mod.loads(msg)
                                 msg_type = recv_data.get("type")
                                 if msg_type == "stats":
-                                    # 客户端上报丢帧/收帧，用于自适应降画质（类似 WebRTC 的 REMB/反馈）
-                                    dropped = recv_data.get("dropped", 0)
-                                    received = max(recv_data.get("received", 0), 1)
-                                    ratio = dropped / received
-                                    if ratio > 0.15:
-                                        if adaptive["bitrate_idx"] > 0:
-                                            adaptive["bitrate_idx"] -= 1
-                                            logger.debug("Adaptive: lower bitrate (dropped=%d received=%d)", dropped, received)
-                                        elif adaptive["scale_idx"] > 0:
-                                            adaptive["scale_idx"] -= 1
-                                            logger.debug("Adaptive: lower resolution (dropped=%d received=%d)", dropped, received)
-                                    elif ratio < 0.05 and received > 15:
-                                        if adaptive["scale_idx"] < len(_SCALE_STEPS) - 1:
-                                            adaptive["scale_idx"] += 1
-                                            logger.debug("Adaptive: raise resolution (dropped=%d received=%d)", dropped, received)
-                                        elif adaptive["bitrate_idx"] < len(_BITRATE_STEPS) - 1:
-                                            adaptive["bitrate_idx"] += 1
-                                            logger.debug("Adaptive: raise bitrate (dropped=%d received=%d)", dropped, received)
+                                    # --no-compress 时固定最高画质，不根据丢帧率调节
+                                    if not no_compress:
+                                        dropped = recv_data.get("dropped", 0)
+                                        received = max(recv_data.get("received", 0), 1)
+                                        ratio = dropped / received
+                                        if ratio > 0.15:
+                                            if adaptive["bitrate_idx"] > 0:
+                                                adaptive["bitrate_idx"] -= 1
+                                                logger.debug("Adaptive: lower bitrate (dropped=%d received=%d)", dropped, received)
+                                            elif adaptive["scale_idx"] > 0:
+                                                adaptive["scale_idx"] -= 1
+                                                logger.debug("Adaptive: lower resolution (dropped=%d received=%d)", dropped, received)
+                                        elif ratio < 0.05 and received > 15:
+                                            if adaptive["scale_idx"] < len(_SCALE_STEPS) - 1:
+                                                adaptive["scale_idx"] += 1
+                                                logger.debug("Adaptive: raise resolution (dropped=%d received=%d)", dropped, received)
+                                            elif adaptive["bitrate_idx"] < len(_BITRATE_STEPS) - 1:
+                                                adaptive["bitrate_idx"] += 1
+                                                logger.debug("Adaptive: raise bitrate (dropped=%d received=%d)", dropped, received)
                                     continue
                                 init_remote()
                                 pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
@@ -773,7 +777,7 @@ def _run_expose_server_socket(
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_serve_socket(port, frame_queue, stop_ev, camera_command_queue, viewer))
+        loop.run_until_complete(_serve_socket(port, frame_queue, stop_ev, camera_command_queue, viewer, no_compress))
     except Exception:
         logger.exception("Socket expose server failed")
     finally:
@@ -1219,19 +1223,19 @@ class HoloViewer(ABC):
         """Override to control axes overlay. Default: self._show_axes_flag."""
         return self._show_axes_flag
 
-    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str], bool, bool]:
-        """Return (expose_port, scribe_addr, headless, use_webrtc). If not set in __init__, parse from sys.argv."""
+    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str], bool, bool, bool]:
+        """Return (expose_port, scribe_addr, headless, use_webrtc, no_compress). If not set in __init__, parse from sys.argv."""
         expose = self._expose_port
         scribe = self._scribe_addr
         if expose is None and scribe is None:
-            expose, scribe, headless, use_webrtc = parse_network_args()
+            expose, scribe, headless, use_webrtc, no_compress = parse_network_args()
         else:
-            _, _, headless, use_webrtc = parse_network_args()
-        return expose, scribe, headless, use_webrtc
+            _, _, headless, use_webrtc, no_compress = parse_network_args()
+        return expose, scribe, headless, use_webrtc, no_compress
 
     def run(self) -> None:
         _ensure_console_logging()
-        expose_port, scribe_addr, headless, use_webrtc = self._get_network_mode()
+        expose_port, scribe_addr, headless, use_webrtc, no_compress = self._get_network_mode()
         if scribe_addr:
             logger.info("Subscribe mode: connecting to %s (no local render)%s", scribe_addr, " [WebRTC]" if use_webrtc else " [WebSocket]")
             if use_webrtc:
@@ -1244,7 +1248,7 @@ class HoloViewer(ABC):
             if use_webrtc:
                 self._run_expose_webrtc(expose_port, headless=headless)
             else:
-                self._run_expose_socket(expose_port, headless=headless)
+                self._run_expose_socket(expose_port, headless=headless, no_compress=no_compress)
             return
         logger.info("Local mode: running render pipeline")
         self._run_local()
@@ -1569,7 +1573,7 @@ class HoloViewer(ABC):
         finally:
             stop_ev.set()
 
-    def _run_expose_socket(self, port: int, headless: bool = False) -> None:
+    def _run_expose_socket(self, port: int, headless: bool = False, no_compress: bool = False) -> None:
         """本地渲染 + WebSocket 推流（默认 socket 模式，H.264），视频与操控同一条连接，适合 SSH 隧道等。"""
         if not _WS_AVAILABLE or not _STREAM_AVAILABLE or av is None:
             raise RuntimeError("Socket mode (H.264) requires: pip install holoviewer[stream] (websockets, aiortc, av)")
@@ -1580,7 +1584,7 @@ class HoloViewer(ABC):
         stop_ev = threading.Event()
         server_thread = threading.Thread(
             target=_run_expose_server_socket,
-            args=(port, frame_queue, stop_ev, camera_command_queue, self),
+            args=(port, frame_queue, stop_ev, camera_command_queue, self, no_compress),
             daemon=True,
         )
         server_thread.start()
