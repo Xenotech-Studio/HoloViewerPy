@@ -371,8 +371,8 @@ def to_uint8_bgr(image_tensor: torch.Tensor) -> np.ndarray:
     return img[:, :, ::-1]
 
 
-def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool, bool, bool]:
-    """Parse --expose-port、--scribe、--subscribe、--headless、--webrtc、--no-compress from argv. Returns (expose_port, scribe_addr, headless, use_webrtc, no_compress)."""
+def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool, bool, bool, str]:
+    """Parse --expose-port、--scribe、--subscribe、--headless、--webrtc、--no-compress、--init-view from argv. Returns (expose_port, scribe_addr, headless, use_webrtc, no_compress, init_view)."""
     if argv is None:
         argv = sys.argv[1:]
     parser = argparse.ArgumentParser()
@@ -382,17 +382,19 @@ def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int],
     parser.add_argument("--headless", action="store_true", help="No cv2 window; use with --expose-port to run server and render pipeline only.")
     parser.add_argument("--webrtc", action="store_true", help="Use WebRTC for streaming (LAN only without TURN); default is WebSocket/socket mode for cross-network (e.g. SSH tunnel)")
     parser.add_argument("--no-compress", action="store_true", help="Disable adaptive quality; keep max bitrate and resolution regardless of network (server only)")
+    parser.add_argument("--init-view", type=str, default="Z_UP", choices=["Z_UP", "Y_UP", "mY_UP"], metavar="MODE", help="Initial view up axis: Z_UP, Y_UP, mY_UP (default: Z_UP)")
     args, _ = parser.parse_known_args(argv)
     expose_port = args.expose_port
     scribe_addr = args.scribe or args.subscribe
     if scribe_addr and ":" not in scribe_addr:
         scribe_addr = "127.0.0.1:" + scribe_addr
-    return expose_port, scribe_addr, getattr(args, "headless", False), getattr(args, "webrtc", False), getattr(args, "no_compress", False)
+    init_view = getattr(args, "init_view", "Z_UP")
+    return expose_port, scribe_addr, getattr(args, "headless", False), getattr(args, "webrtc", False), getattr(args, "no_compress", False), init_view
 
 
 def is_client(argv: Optional[List[str]] = None) -> bool:
     """True 表示当前为订阅端（--scribe/--subscribe），仅收流不渲染，可据此延迟导入仅服务端需要的包。"""
-    _, scribe_addr, _, _, _ = parse_network_args(argv)
+    _, scribe_addr, _, _, _, _ = parse_network_args(argv)
     return scribe_addr is not None
 
 
@@ -1228,9 +1230,9 @@ class HoloViewer(ABC):
         expose = self._expose_port
         scribe = self._scribe_addr
         if expose is None and scribe is None:
-            expose, scribe, headless, use_webrtc, no_compress = parse_network_args()
+            expose, scribe, headless, use_webrtc, no_compress, _ = parse_network_args()
         else:
-            _, _, headless, use_webrtc, no_compress = parse_network_args()
+            _, _, headless, use_webrtc, no_compress, _ = parse_network_args()
         return expose, scribe, headless, use_webrtc, no_compress
 
     def run(self) -> None:
