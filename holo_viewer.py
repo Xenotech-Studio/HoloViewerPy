@@ -371,8 +371,10 @@ def to_uint8_bgr(image_tensor: torch.Tensor) -> np.ndarray:
     return img[:, :, ::-1]
 
 
-def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool, bool, bool, str]:
-    """Parse --expose-port、--scribe、--subscribe、--headless、--webrtc、--no-compress、--init-view from argv. Returns (expose_port, scribe_addr, headless, use_webrtc, no_compress, init_view)."""
+def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool, bool, bool, str, Optional[int], Optional[int]]:
+    """Parse --expose-port、--scribe、--subscribe、--headless、--webrtc、--no-compress、--init-view、--width、--height from argv.
+    Returns (expose_port, scribe_addr, headless, use_webrtc, no_compress, init_view, width, height).
+    width/height 用于订阅端：窗口尺寸并会以 viewport_resize 事件发给服务端，供 headless 服务端按客户端视口渲染。"""
     if argv is None:
         argv = sys.argv[1:]
     parser = argparse.ArgumentParser()
@@ -383,18 +385,22 @@ def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int],
     parser.add_argument("--webrtc", action="store_true", help="Use WebRTC for streaming (LAN only without TURN); default is WebSocket/socket mode for cross-network (e.g. SSH tunnel)")
     parser.add_argument("--no-compress", action="store_true", help="Disable adaptive quality; keep max bitrate and resolution regardless of network (server only)")
     parser.add_argument("--init-view", type=str, default="Z_UP", choices=["Z_UP", "Y_UP", "mY_UP"], metavar="MODE", help="Initial view up axis: Z_UP, Y_UP, mY_UP (default: Z_UP)")
+    parser.add_argument("--width", type=int, default=None, metavar="W", help="Subscribe/client: window width; sent to server as viewport_resize for headless render size")
+    parser.add_argument("--height", type=int, default=None, metavar="H", help="Subscribe/client: window height; sent to server as viewport_resize for headless render size")
     args, _ = parser.parse_known_args(argv)
     expose_port = args.expose_port
     scribe_addr = args.scribe or args.subscribe
     if scribe_addr and ":" not in scribe_addr:
         scribe_addr = "127.0.0.1:" + scribe_addr
     init_view = getattr(args, "init_view", "Z_UP")
-    return expose_port, scribe_addr, getattr(args, "headless", False), getattr(args, "webrtc", False), getattr(args, "no_compress", False), init_view
+    width = getattr(args, "width", None)
+    height = getattr(args, "height", None)
+    return expose_port, scribe_addr, getattr(args, "headless", False), getattr(args, "webrtc", False), getattr(args, "no_compress", False), init_view, width, height
 
 
 def is_client(argv: Optional[List[str]] = None) -> bool:
     """True 表示当前为订阅端（--scribe/--subscribe），仅收流不渲染，可据此延迟导入仅服务端需要的包。"""
-    _, scribe_addr, _, _, _, _ = parse_network_args(argv)
+    _, scribe_addr, _, _, _, _, _, _ = parse_network_args(argv)
     return scribe_addr is not None
 
 
@@ -501,6 +507,11 @@ def _run_expose_server(
                                 nonlocal remote_pos, remote_yaw, remote_pitch
                                 try:
                                     recv_data = __import__("json").loads(message) if isinstance(message, str) else __import__("json").loads(message.decode("utf-8"))
+                                    w_raw, h_raw = recv_data.get("width"), recv_data.get("height")
+                                    if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
+                                        w, h = max(64, min(4096, int(w_raw))), max(64, min(4096, int(h_raw)))
+                                        v._remote_render_size = [w, h]
+                                        logger.info("Viewport resize from client: %dx%d", w, h)
                                     init_remote()
                                     pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
                                     remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
@@ -620,6 +631,9 @@ def _run_expose_server_socket(
                 _BITRATE_STEPS = [300_000, 500_000, 700_000, 1_000_000, 1_500_000]
                 _SCALE_STEPS = [0.5, 0.75, 1.0]
                 adaptive = {"bitrate_idx": 4, "scale_idx": 2}  # 初始最高质量
+                # --no-compress 时：更高码率 + 每帧 I 帧（无 P 帧预测，动/静都一致清晰，仍为 H.264 有损）
+                _NO_COMPRESS_BITRATE = 20_000_000  # 20 Mbps，1080p 全 I 帧高画质
+                _KEYFRAME_INTERVAL = 1 if no_compress else 30  # no_compress 时全 I 帧，否则约 1s 一关键帧
 
                 # 低延迟：只编码并发送最新一帧，丢弃积压的旧帧（last-frame-wins）
                 def _get_latest_frame() -> Optional[FramePacket]:
@@ -634,9 +648,6 @@ def _run_expose_server_socket(
                         except Empty:
                             break
                     return latest
-
-                # 周期性关键帧（每 KEYFRAME_INTERVAL 帧一个 I 帧，便于恢复与限时延）
-                _KEYFRAME_INTERVAL = 30  # 约 1 秒 @ 30fps
                 codec: Optional[Any] = None
                 pts = 0
                 time_base = fractions.Fraction(1, 30)
@@ -657,7 +668,7 @@ def _run_expose_server_socket(
                         frame_bgr = cv2.resize(frame_bgr, (encode_w, encode_h), interpolation=cv2.INTER_LINEAR)
                     else:
                         encode_w, encode_h = w, h
-                    bitrate = _BITRATE_STEPS[bitrate_idx]
+                    bitrate = _NO_COMPRESS_BITRATE if no_compress else _BITRATE_STEPS[bitrate_idx]
                     if codec is None or codec.width != encode_w or codec.height != encode_h:
                         codec = av.CodecContext.create("libx264", "w")
                         codec.width = encode_w
@@ -736,6 +747,23 @@ def _run_expose_server_socket(
                                                 adaptive["bitrate_idx"] += 1
                                                 logger.debug("Adaptive: raise bitrate (dropped=%d received=%d)", dropped, received)
                                     continue
+                                if msg_type == "viewport_resize":
+                                    w = recv_data.get("width")
+                                    h = recv_data.get("height")
+                                    if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+                                        w, h = int(w), int(h)
+                                        w = max(64, min(4096, w))
+                                        h = max(64, min(4096, h))
+                                        v.width, v.height = w, h
+                                        logger.info("Viewport resize from client: %dx%d", w, h)
+                                    continue
+                                # 普通操控消息里也可能带 width/height（订阅端每帧会发），按需更新并打日志（仅尺寸变化时）
+                                w_raw, h_raw = recv_data.get("width"), recv_data.get("height")
+                                if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
+                                    w, h = max(64, min(4096, int(w_raw))), max(64, min(4096, int(h_raw)))
+                                    if (v.width, v.height) != (w, h):
+                                        v.width, v.height = w, h
+                                        logger.info("Viewport resize from client: %dx%d", w, h)
                                 init_remote()
                                 pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
                                 remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
@@ -1151,7 +1179,7 @@ class HoloViewer(ABC):
         scribe_addr: Optional[str] = None,
     ) -> None:
         # headless + expose-port 时无需本地窗口，可不依赖 cv2；其余模式需要 cv2 做窗口/显示
-        _expose, _scribe, _headless, _, _, _ = parse_network_args()
+        _expose, _scribe, _headless, _, _, _, _cli_w, _cli_h = parse_network_args()
         need_cv2 = not (_expose is not None and _headless)
         if need_cv2 and cv2 is None:
             raise RuntimeError(
@@ -1168,6 +1196,12 @@ class HoloViewer(ABC):
         self.window_name = window_name
         self.width = width
         self.height = height
+        # 订阅端：命令行 --width/--height 覆盖，用于窗口尺寸并会以 viewport_resize 发给服务端
+        if _scribe is not None:
+            if _cli_w is not None and _cli_w > 0:
+                self.width = _cli_w
+            if _cli_h is not None and _cli_h > 0:
+                self.height = _cli_h
         self.fov_y_deg = fov_y_deg
         self.pan_sensitivity = pan_sensitivity
         self.move_speed = move_speed
@@ -1228,19 +1262,22 @@ class HoloViewer(ABC):
         """Override to control axes overlay. Default: self._show_axes_flag."""
         return self._show_axes_flag
 
-    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str], bool, bool, bool]:
-        """Return (expose_port, scribe_addr, headless, use_webrtc, no_compress). If not set in __init__, parse from sys.argv."""
+    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str], bool, bool, bool, Optional[int], Optional[int]]:
+        """Return (expose_port, scribe_addr, headless, use_webrtc, no_compress, width, height). If not set in __init__, parse from sys.argv."""
         expose = self._expose_port
         scribe = self._scribe_addr
         if expose is None and scribe is None:
-            expose, scribe, headless, use_webrtc, no_compress, _ = parse_network_args()
+            expose, scribe, headless, use_webrtc, no_compress, _, width, height = parse_network_args()
         else:
-            _, _, headless, use_webrtc, no_compress, _ = parse_network_args()
-        return expose, scribe, headless, use_webrtc, no_compress
+            _, _, headless, use_webrtc, no_compress, _, width, height = parse_network_args()
+        return expose, scribe, headless, use_webrtc, no_compress, width, height
 
     def run(self) -> None:
         _ensure_console_logging()
-        expose_port, scribe_addr, headless, use_webrtc, no_compress = self._get_network_mode()
+        expose_port, scribe_addr, headless, use_webrtc, no_compress, cli_width, cli_height = self._get_network_mode()
+        if scribe_addr and cli_width is not None and cli_height is not None:
+            self.width = max(64, min(4096, cli_width))
+            self.height = max(64, min(4096, cli_height))
         if scribe_addr:
             logger.info("Subscribe mode: connecting to %s (no local render)%s", scribe_addr, " [WebRTC]" if use_webrtc else " [WebSocket]")
             if use_webrtc:
@@ -1304,6 +1341,24 @@ class HoloViewer(ABC):
         prev_plus = False
         prev_minus = False
         prev_custom: Dict[int, bool] = {}
+        # 向服务端同步视口尺寸（可反复发送；命令行客户端用 --width/--height，未来其他客户端可发实时缩放）
+        last_sent_viewport: Tuple[int, int] = (self.width, self.height)
+
+        def _send_viewport_resize_if_changed() -> None:
+            nonlocal last_sent_viewport
+            w, h = int(self.width), int(self.height)
+            if w < 64 or h < 64:
+                return
+            if (w, h) != last_sent_viewport:
+                last_sent_viewport = (w, h)
+                try:
+                    camera_send_queue.put_nowait({"type": "viewport_resize", "width": w, "height": h})
+                    logger.info("Viewport resize sent to server: %dx%d", w, h)
+                except Exception:
+                    pass
+
+        # 连接后尽快发送一次当前视口，让 headless 服务端按客户端尺寸渲染
+        _send_viewport_resize_if_changed()
 
         def on_mouse_scribe(event: int, x: int, y: int, flags: int, param: Any) -> None:
             if event == cv2.EVENT_LBUTTONDOWN:
@@ -1329,6 +1384,11 @@ class HoloViewer(ABC):
                 mouse_delta[1] += dy
 
         cv2.setMouseCallback(self.window_name, on_mouse_scribe)
+        # 启动时发一次视口尺寸，供 headless 服务端按客户端窗口渲染；后续每帧 control 也会带 width/height
+        try:
+            camera_send_queue.put_nowait({"width": self.width, "height": self.height})
+        except Exception:
+            pass
         try:
             while True:
                 key = cv2.waitKey(1) & 0xFF
@@ -1422,6 +1482,8 @@ class HoloViewer(ABC):
                     "q": q, "e": e, "toggle_axes": toggle_axes,
                     "nine": nine, "zero": zero,
                     "__input_ts": time.perf_counter(),
+                    "width": self.width,
+                    "height": self.height,
                 }
                 for i, (key_spec, _) in enumerate(self._key_handlers):
                     curr = 1 if _is_key_pressed(key_spec, key_cv2) else 0
@@ -1432,8 +1494,12 @@ class HoloViewer(ABC):
                         sys.stderr.flush()
                     prev_custom[i] = bool(curr)
                 try:
+                    viewport_resize_kept: Optional[Dict[str, Any]] = None
                     while True:
-                        camera_send_queue.get_nowait()
+                        msg = camera_send_queue.get_nowait()
+                        if isinstance(msg, dict) and msg.get("type") == "viewport_resize" and viewport_resize_kept is None:
+                            viewport_resize_kept = msg
+                            camera_send_queue.put_nowait(msg)
                 except Empty:
                     pass
                 try:
@@ -1489,6 +1555,7 @@ class HoloViewer(ABC):
                         _x, _y, win_w, win_h = cv2.getWindowImageRect(self.window_name)
                         if win_w > 0 and win_h > 0:
                             self.width, self.height = int(win_w), int(win_h)
+                            _send_viewport_resize_if_changed()
                     except Exception:
                         pass
                     if getattr(show_img, "ndim", 0) >= 2:
@@ -1633,6 +1700,10 @@ class HoloViewer(ABC):
         last_frame_input_ts: Optional[float] = None
         try:
             while not stop_ev.is_set():
+                # 订阅端发来的视口尺寸（可反复发送）；仅 headless 时生效
+                sz = getattr(self, "_remote_render_size", None)
+                if sz is not None:
+                    self.width, self.height = sz[0], sz[1]
                 remote_cam: Optional[CameraCommand] = None
                 try:
                     while True:

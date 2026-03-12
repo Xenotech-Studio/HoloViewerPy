@@ -48,6 +48,7 @@ python sample.py --subscribe 192.168.1.100:1145 --webrtc
 - **默认 socket 模式**：`--expose-port` 在指定端口启动 WebSocket 服务，经同一条连接推送 H.264 帧并接收 JSON 操控。`--scribe HOST:PORT` 连接后只收帧、不本地渲染。无需 TURN，可经 SSH 反向隧道等跨网使用。
 - **`--webrtc`**：改用 WebRTC 推流（信令 WebSocket + 媒体 ICE）。适合局域网；跨网需公网 TURN。
 - **`--headless`**：与 `--expose-port` 同用时不创建 cv2 窗口，仅跑渲染与推流。
+- **视口尺寸（可反复发送）**：订阅端用 `--width W --height H` 指定窗口尺寸；该尺寸会随 control 消息发给服务端（连接后立即发一条，之后每帧 control 也带 `width`/`height`）。headless 服务端按客户端发来的尺寸渲染，因此服务端出图分辨率与客户端窗口一致。未来其他客户端（如 Web）可直接读实时窗口尺寸并发送，协议已支持。
 
 ## 使用方法
 
