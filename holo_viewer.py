@@ -1150,9 +1150,12 @@ class HoloViewer(ABC):
         expose_port: Optional[int] = None,
         scribe_addr: Optional[str] = None,
     ) -> None:
-        if cv2 is None:
+        # headless + expose-port 时无需本地窗口，可不依赖 cv2；其余模式需要 cv2 做窗口/显示
+        _expose, _scribe, _headless, _, _, _ = parse_network_args()
+        need_cv2 = not (_expose is not None and _headless)
+        if need_cv2 and cv2 is None:
             raise RuntimeError(
-                "OpenCV (cv2) is required. Install via pip install opencv-python."
+                "OpenCV (cv2) is required. Install via pip install opencv-python or opencv-python-headless."
             )
         canonical = (
             canonical_initial.astype(np.float32)
