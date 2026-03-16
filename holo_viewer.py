@@ -383,7 +383,7 @@ def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int],
     parser.add_argument("--subscribe", type=str, default=None, metavar="HOST:PORT or PORT", help="Same as --scribe; if only PORT, use 127.0.0.1:PORT")
     parser.add_argument("--headless", action="store_true", help="No cv2 window; use with --expose-port to run server and render pipeline only.")
     parser.add_argument("--webrtc", action="store_true", help="Use WebRTC for streaming (LAN only without TURN); default is WebSocket/socket mode for cross-network (e.g. SSH tunnel)")
-    parser.add_argument("--no-compress", action="store_true", help="Disable adaptive quality; keep max bitrate and resolution regardless of network (server only)")
+    parser.add_argument("--no-compress", action="store_true", help="Subscribe: request high quality (no adaptive downscale). Expose: default for clients that do not send prefer.")
     parser.add_argument("--init-view", type=str, default="Z_UP", choices=["Z_UP", "Y_UP", "mY_UP"], metavar="MODE", help="Initial view up axis: Z_UP, Y_UP, mY_UP (default: Z_UP)")
     parser.add_argument("--width", type=int, default=None, metavar="W", help="Subscribe/client: window width; sent to server as viewport_resize for headless render size")
     parser.add_argument("--height", type=int, default=None, metavar="H", help="Subscribe/client: window height; sent to server as viewport_resize for headless render size")
@@ -625,15 +625,35 @@ def _run_expose_server_socket(
             encode_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
                 await websocket.send(json_mod.dumps({"type": "tunnel", "version": 1, "codec": "h264"}))
+                # 客户端可在连接后首条消息发 type=prefer, no_compress=true；否则用服务端默认
+                connection_no_compress = no_compress
+                pending_first: List[Any] = [None]
+                try:
+                    first_msg = await asyncio.wait_for(websocket.recv(), timeout=2.0)
+                    if isinstance(first_msg, str):
+                        try:
+                            first_data = json_mod.loads(first_msg)
+                            if first_data.get("type") == "prefer":
+                                connection_no_compress = bool(first_data.get("no_compress", False))
+                                logger.info("Client requested no_compress=%s", connection_no_compress)
+                            else:
+                                pending_first[0] = first_msg
+                        except Exception:
+                            pending_first[0] = first_msg
+                    else:
+                        pending_first[0] = first_msg
+                except asyncio.TimeoutError:
+                    pass
+
                 loop = asyncio.get_running_loop()
 
                 # 自适应画质（类似 WebRTC REMB/反馈）：根据客户端 stats 调节码率与分辨率
                 _BITRATE_STEPS = [300_000, 500_000, 700_000, 1_000_000, 1_500_000]
                 _SCALE_STEPS = [0.5, 0.75, 1.0]
                 adaptive = {"bitrate_idx": 4, "scale_idx": 2}  # 初始最高质量
-                # --no-compress 时：更高码率 + 每帧 I 帧（无 P 帧预测，动/静都一致清晰，仍为 H.264 有损）
+                # no_compress 时：更高码率 + 每帧 I 帧（无 P 帧预测，动/静都一致清晰，仍为 H.264 有损）
                 _NO_COMPRESS_BITRATE = 20_000_000  # 20 Mbps，1080p 全 I 帧高画质
-                _KEYFRAME_INTERVAL = 1 if no_compress else 30  # no_compress 时全 I 帧，否则约 1s 一关键帧
+                _KEYFRAME_INTERVAL = 1 if connection_no_compress else 30  # no_compress 时全 I 帧，否则约 1s 一关键帧
 
                 # 低延迟：只编码并发送最新一帧，丢弃积压的旧帧（last-frame-wins）
                 def _get_latest_frame() -> Optional[FramePacket]:
@@ -668,7 +688,7 @@ def _run_expose_server_socket(
                         frame_bgr = cv2.resize(frame_bgr, (encode_w, encode_h), interpolation=cv2.INTER_LINEAR)
                     else:
                         encode_w, encode_h = w, h
-                    bitrate = _NO_COMPRESS_BITRATE if no_compress else _BITRATE_STEPS[bitrate_idx]
+                    bitrate = _NO_COMPRESS_BITRATE if connection_no_compress else _BITRATE_STEPS[bitrate_idx]
                     if codec is None or codec.width != encode_w or codec.height != encode_h:
                         codec = av.CodecContext.create("libx264", "w")
                         codec.width = encode_w
@@ -722,13 +742,17 @@ def _run_expose_server_socket(
                     nonlocal remote_pos, remote_yaw, remote_pitch
                     while not stop.is_set():
                         try:
-                            msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                            if pending_first[0] is not None:
+                                msg = pending_first[0]
+                                pending_first[0] = None
+                            else:
+                                msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                             if isinstance(msg, str):
                                 recv_data = json_mod.loads(msg)
                                 msg_type = recv_data.get("type")
                                 if msg_type == "stats":
-                                    # --no-compress 时固定最高画质，不根据丢帧率调节
-                                    if not no_compress:
+                                    # no_compress 时固定最高画质，不根据丢帧率调节
+                                    if not connection_no_compress:
                                         dropped = recv_data.get("dropped", 0)
                                         received = max(recv_data.get("received", 0), 1)
                                         ratio = dropped / received
@@ -1007,8 +1031,9 @@ def _run_scribe_client_socket(
     frame_queue: "Queue[Any]",
     stop_ev: threading.Event,
     camera_send_queue: Optional["Queue[Dict[str, Any]]"] = None,
+    no_compress: bool = False,
 ) -> None:
-    """WebSocket 纯 socket 模式：客户端经同一条连接收 H.264 帧、发 JSON 操控。低延迟：只保留最新帧。自适应：定期上报 stats 供服务端降画质。"""
+    """WebSocket 纯 socket 模式：客户端经同一条连接收 H.264 帧、发 JSON 操控。低延迟：只保留最新帧。no_compress 时连接后发 type=prefer 请求服务端高画质。"""
     if not _WS_AVAILABLE or websockets is None:
         try:
             frame_queue.put_nowait(("error", "Socket mode requires: pip install websockets"))
@@ -1054,6 +1079,13 @@ def _run_scribe_client_socket(
                 else:
                     put_error("Expected tunnel greeting (string), got binary")
                     return
+
+                if no_compress:
+                    try:
+                        await ws.send(json_mod.dumps({"type": "prefer", "no_compress": True}))
+                    except Exception:
+                        put_error("Failed to send prefer no_compress")
+                        return
 
                 decoder = av.CodecContext.create("h264", "r")
                 time_base = fractions.Fraction(1, 30)
@@ -1283,7 +1315,7 @@ class HoloViewer(ABC):
             if use_webrtc:
                 self._run_scribe_webrtc(scribe_addr)
             else:
-                self._run_scribe_socket(scribe_addr)
+                self._run_scribe_socket(scribe_addr, no_compress=no_compress)
             return
         if expose_port is not None:
             logger.info("Expose mode: WebSocket server on port %s%s%s", expose_port, " (headless)" if headless else "", " [WebRTC]" if use_webrtc else " [WebSocket]")
@@ -1594,8 +1626,8 @@ class HoloViewer(ABC):
             except Exception:
                 pass
 
-    def _run_scribe_socket(self, addr: str) -> None:
-        """连接远端 WebSocket（默认 socket 模式），经同一条连接收 H.264 帧与发操控，适合 SSH 隧道等跨网。"""
+    def _run_scribe_socket(self, addr: str, no_compress: bool = False) -> None:
+        """连接远端 WebSocket（默认 socket 模式），经同一条连接收 H.264 帧与发操控，适合 SSH 隧道等跨网。no_compress 时请求服务端高画质。"""
         if not _WS_AVAILABLE or not _STREAM_AVAILABLE or av is None:
             raise RuntimeError("Socket mode (H.264) requires: pip install holoviewer[stream] (websockets, aiortc, av)")
         if cv2 is None:
@@ -1607,7 +1639,7 @@ class HoloViewer(ABC):
         cv2.resizeWindow(self.window_name, self.width, self.height)
         thread = threading.Thread(
             target=_run_scribe_client_socket,
-            args=(addr, frame_queue, stop_ev, camera_send_queue),
+            args=(addr, frame_queue, stop_ev, camera_send_queue, no_compress),
             daemon=True,
         )
         thread.start()
