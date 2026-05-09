@@ -688,6 +688,14 @@ def _run_expose_server_socket(
                         frame_bgr = cv2.resize(frame_bgr, (encode_w, encode_h), interpolation=cv2.INTER_LINEAR)
                     else:
                         encode_w, encode_h = w, h
+                    # libx264 + yuv420p 要求偶数宽高；订阅端窗口尺寸经常是奇数，直接编会 avcodec_open2 失败。
+                    if (encode_w & 1) or (encode_h & 1):
+                        encode_w &= ~1
+                        encode_h &= ~1
+                        if cv2 is not None and (encode_w, encode_h) != frame_bgr.shape[1::-1]:
+                            frame_bgr = cv2.resize(
+                                frame_bgr, (encode_w, encode_h), interpolation=cv2.INTER_LINEAR
+                            )
                     bitrate = _NO_COMPRESS_BITRATE if connection_no_compress else _BITRATE_STEPS[bitrate_idx]
                     if codec is None or codec.width != encode_w or codec.height != encode_h:
                         codec = av.CodecContext.create("libx264", "w")
@@ -697,9 +705,10 @@ def _run_expose_server_socket(
                         codec.time_base = time_base
                         codec.framerate = fractions.Fraction(30, 1)
                         codec.bit_rate = bitrate
+                        # level 41 上限到 1080p30，覆盖常见笔记本/桌面视口；31 限制太严
                         codec.options = {
                             "tune": "zerolatency",
-                            "level": "31",
+                            "level": "41",
                             "rc_lookahead": "0",  # 禁用 lookahead，降低编码延迟
                         }
                         codec.profile = "baseline"
@@ -735,7 +744,13 @@ def _run_expose_server_socket(
                                 await websocket.send(json_mod.dumps({"type": "frame_meta", "input_ts": item[2]}))
                             if data:
                                 await websocket.send(data)
-                        except Exception:
+                        except Exception as _send_err:
+                            # 客户端正常断开（1000 OK / 1001 going away）属于常规关闭，
+                            # 不要 ERROR 刷日志；其它异常（编码器失败、协议崩等）保留 traceback 暴露根因。
+                            if isinstance(_send_err, websockets.exceptions.ConnectionClosed):
+                                logger.info("send_frames stopped: %s", _send_err)
+                            else:
+                                logger.exception("send_frames loop dying: %s", _send_err)
                             break
 
                 async def recv_control() -> None:
