@@ -371,22 +371,27 @@ def to_uint8_bgr(image_tensor: torch.Tensor) -> np.ndarray:
     return img[:, :, ::-1]
 
 
-def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool, bool, bool, str, Optional[int], Optional[int]]:
-    """Parse --expose-port、--scribe、--subscribe、--headless、--webrtc、--no-compress、--init-view、--width、--height from argv.
-    Returns (expose_port, scribe_addr, headless, use_webrtc, no_compress, init_view, width, height).
-    width/height 用于订阅端：窗口尺寸并会以 viewport_resize 事件发给服务端，供 headless 服务端按客户端视口渲染。"""
+def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int], Optional[str], bool, bool, bool, str, Optional[int], Optional[int], Optional[str], Optional[str]]:
+    """Parse --expose-port / --signaling / --room-id / --scribe / --subscribe / --headless /
+    --webrtc / --no-compress / --init-view / --width / --height from argv.
+    Returns (expose_port, scribe_addr, headless, use_webrtc, no_compress, init_view, width, height,
+             signaling_url, room_id).
+    width/height 用于订阅端：窗口尺寸并会以 viewport_resize 事件发给服务端，供 headless 服务端按客户端视口渲染。
+    --signaling URL --room-id ID 启用中转模式（WebRTC publisher 主动连中央信令 wss），与 --expose-port 互斥。"""
     if argv is None:
         argv = sys.argv[1:]
     parser = argparse.ArgumentParser()
     parser.add_argument("--expose-port", type=int, default=None, metavar="PORT", help="Start WebSocket server on PORT for streaming (default: socket mode; use --webrtc for WebRTC)")
     parser.add_argument("--scribe", type=str, default=None, metavar="HOST:PORT", help="Connect to remote HOST:PORT and display stream (no local render)")
     parser.add_argument("--subscribe", type=str, default=None, metavar="HOST:PORT or PORT", help="Same as --scribe; if only PORT, use 127.0.0.1:PORT")
-    parser.add_argument("--headless", action="store_true", help="No cv2 window; use with --expose-port to run server and render pipeline only.")
+    parser.add_argument("--headless", action="store_true", help="No cv2 window; use with --expose-port / --signaling to run server and render pipeline only.")
     parser.add_argument("--webrtc", action="store_true", help="Use WebRTC for streaming (LAN only without TURN); default is WebSocket/socket mode for cross-network (e.g. SSH tunnel)")
     parser.add_argument("--no-compress", action="store_true", help="Subscribe: request high quality (no adaptive downscale). Expose: default for clients that do not send prefer.")
     parser.add_argument("--init-view", type=str, default="Z_UP", choices=["Z_UP", "Y_UP", "mY_UP"], metavar="MODE", help="Initial view up axis: Z_UP, Y_UP, mY_UP (default: Z_UP)")
     parser.add_argument("--width", type=int, default=None, metavar="W", help="Subscribe/client: window width; sent to server as viewport_resize for headless render size")
     parser.add_argument("--height", type=int, default=None, metavar="H", help="Subscribe/client: window height; sent to server as viewport_resize for headless render size")
+    parser.add_argument("--signaling", type=str, default=None, metavar="WSS_URL", help="WebRTC relay publisher mode: connect outward to this signaling URL (e.g. wss://4d.kiriengine.com/api/holoviewer/signal) and serve the configured room. Implies --webrtc.")
+    parser.add_argument("--room-id", type=str, default=None, metavar="ID", help="WebRTC relay publisher mode: room identifier (also serves as capability token; keep it long & random).")
     args, _ = parser.parse_known_args(argv)
     expose_port = args.expose_port
     scribe_addr = args.scribe or args.subscribe
@@ -395,12 +400,14 @@ def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int],
     init_view = getattr(args, "init_view", "Z_UP")
     width = getattr(args, "width", None)
     height = getattr(args, "height", None)
-    return expose_port, scribe_addr, getattr(args, "headless", False), getattr(args, "webrtc", False), getattr(args, "no_compress", False), init_view, width, height
+    signaling_url = getattr(args, "signaling", None)
+    room_id = getattr(args, "room_id", None)
+    return expose_port, scribe_addr, getattr(args, "headless", False), getattr(args, "webrtc", False), getattr(args, "no_compress", False), init_view, width, height, signaling_url, room_id
 
 
 def is_client(argv: Optional[List[str]] = None) -> bool:
     """True 表示当前为订阅端（--scribe/--subscribe），仅收流不渲染，可据此延迟导入仅服务端需要的包。"""
-    _, scribe_addr, _, _, _, _, _, _ = parse_network_args(argv)
+    _, scribe_addr, _, _, _, _, _, _, _, _ = parse_network_args(argv)
     return scribe_addr is not None
 
 
@@ -577,6 +584,213 @@ def _run_expose_server(
     finally:
         loop.close()
         logger.info("WebSocket server stopped")
+
+
+def _run_relay_publisher_webrtc(
+    signaling_url: str,
+    room_id: str,
+    frame_queue: "Queue[FramePacket]",
+    stop_ev: threading.Event,
+    camera_command_queue: "Queue[CameraCommand]",
+    viewer: "HoloViewer",
+) -> None:
+    """WebRTC publisher 中转模式：主动连中央信令 wss，注册到 room；每当 subscriber 进入即接受
+    其 offer 并回 answer，subscriber 退出后等下一个。与 _run_expose_server 报文格式 1:1 兼容，
+    差别只是网络方向（outbound + 长连）和多了几条 hello / peer_joined / peer_ready / peer_left
+    控制消息（由中转层注入，aiortc 端不关心，直接丢弃）。
+    """
+    if not _STREAM_AVAILABLE:
+        return
+    if websockets is None:
+        logger.error("Relay mode requires the `websockets` package")
+        return
+    from aiortc.mediastreams import VideoStreamTrack  # type: ignore
+
+    class QueueVideoTrack(VideoStreamTrack):
+        kind = "video"
+
+        def __init__(self, q: "Queue[FramePacket]", stop: threading.Event) -> None:
+            super().__init__()
+            self._queue = q
+            self._stop = stop
+            self._pts = 0
+
+        async def recv(self) -> Any:
+            while not self._stop.is_set():
+                try:
+                    frame_bgr, _, _ = self._queue.get(timeout=0.5)
+                except Empty:
+                    continue
+                self._pts += 1
+                av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
+                av_frame.pts = self._pts
+                av_frame.time_base = __import__("fractions").Fraction(1, 30)
+                return av_frame
+            raise Exception("track stopped")
+
+    json_mod = __import__("json")
+    sep = "&" if "?" in signaling_url else "?"
+    url = f"{signaling_url}{sep}room={room_id}&role=publisher"
+
+    async def _serve() -> None:
+        backoff = 1.0
+        while not stop_ev.is_set():
+            try:
+                logger.info("Relay publisher: connecting to %s ...", url)
+                async with websockets.connect(  # type: ignore[union-attr]
+                    url, ping_interval=20, ping_timeout=20, close_timeout=2,
+                ) as ws:
+                    backoff = 1.0
+                    await _session(ws)
+            except Exception as e:  # noqa: BLE001
+                if stop_ev.is_set():
+                    break
+                logger.warning("Relay publisher: connection error: %s; retry in %.1fs", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+    async def _session(ws: Any) -> None:
+        pc: Optional[Any] = None
+        frame_track: Optional[QueueVideoTrack] = None
+        remote_pos: Optional[np.ndarray] = None
+        remote_yaw: Optional[float] = None
+        remote_pitch: Optional[float] = None
+
+        def init_remote() -> None:
+            nonlocal remote_pos, remote_yaw, remote_pitch
+            if remote_pos is not None:
+                return
+            pos, forward = viewer.get_initial_pose()
+            pos = pos.astype(np.float64)
+            forward = forward / (np.linalg.norm(forward) + 1e-9)
+            remote_yaw, remote_pitch = viewer.axis_system.look_dir_to_angles(forward)
+            remote_pos = pos
+
+        async def reset_pc() -> None:
+            nonlocal pc, frame_track
+            if pc is not None:
+                try:
+                    await pc.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            pc = None
+            frame_track = None
+
+        async def accept_offer(sdp: str) -> None:
+            nonlocal pc, frame_track, remote_pos, remote_yaw, remote_pitch
+            await reset_pc()
+            pc = RTCPeerConnection(_default_rtc_configuration())
+            frame_track = QueueVideoTrack(frame_queue, stop_ev)
+            pc.addTrack(frame_track)
+
+            @pc.on("datachannel")
+            def on_datachannel(channel: Any) -> None:  # noqa: ARG001
+                if getattr(channel, "label", "") != "input":
+                    return
+
+                @channel.on("message")
+                def on_message(message: Any) -> None:
+                    nonlocal remote_pos, remote_yaw, remote_pitch
+                    try:
+                        if isinstance(message, str):
+                            recv_data = json_mod.loads(message)
+                        else:
+                            recv_data = json_mod.loads(message.decode("utf-8"))
+                        w_raw = recv_data.get("width")
+                        h_raw = recv_data.get("height")
+                        if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
+                            w = max(64, min(4096, int(w_raw)))
+                            h = max(64, min(4096, int(h_raw)))
+                            viewer._remote_render_size = [w, h]
+                        init_remote()
+                        pos, yaw, pitch = viewer._apply_input(
+                            remote_pos, remote_yaw, remote_pitch, recv_data
+                        )
+                        remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                        try:
+                            camera_command_queue.put_nowait((pos, yaw, pitch, None))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            @pc.on("icecandidate")
+            def on_ice(candidate: Any) -> None:
+                if not candidate:
+                    return
+                cand_str = "candidate:" + candidate_to_sdp(candidate)
+                asyncio.ensure_future(ws.send(json_mod.dumps({
+                    "type": "candidate",
+                    "candidate": cand_str,
+                    "sdpMid": getattr(candidate, "sdpMid", None),
+                    "sdpMLineIndex": getattr(candidate, "sdpMLineIndex", None),
+                })))
+
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            await ws.send(json_mod.dumps({
+                "type": pc.localDescription.type,
+                "sdp": pc.localDescription.sdp,
+            }))
+            logger.info("Relay publisher: answer sent")
+
+        logger.info("Relay publisher: ws connected, awaiting peer in room=%s", room_id)
+        try:
+            while not stop_ev.is_set():
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                if isinstance(msg, bytes):
+                    continue
+                try:
+                    data = json_mod.loads(msg)
+                except Exception:  # noqa: BLE001
+                    continue
+                msg_type = data.get("type")
+                if msg_type == "hello":
+                    logger.info("Relay publisher: server hello room=%s", data.get("room"))
+                elif msg_type == "peer_joined":
+                    logger.info("Relay publisher: subscriber joined")
+                elif msg_type == "peer_ready":
+                    logger.info("Relay publisher: subscriber already in room (joined first)")
+                elif msg_type == "peer_left":
+                    logger.info("Relay publisher: subscriber left, tearing down peer connection")
+                    await reset_pc()
+                elif msg_type == "offer" and isinstance(data.get("sdp"), str):
+                    try:
+                        await accept_offer(data["sdp"])
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Relay publisher: accept_offer failed: %s", e)
+                        await reset_pc()
+                elif msg_type == "candidate" and data.get("candidate"):
+                    if pc is None:
+                        continue
+                    raw = data["candidate"]
+                    sdp_part = raw.split(":", 1)[1] if isinstance(raw, str) and ":" in raw else raw
+                    try:
+                        c = candidate_from_sdp(sdp_part)
+                        c.sdpMid = data.get("sdpMid")
+                        c.sdpMLineIndex = data.get("sdpMLineIndex")
+                        await pc.addIceCandidate(c)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Relay publisher: addIceCandidate failed: %s", e)
+                elif msg_type == "error":
+                    logger.error("Relay publisher: server error: %s", data.get("reason"))
+                    return
+        finally:
+            await reset_pc()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_serve())
+    except Exception:  # noqa: BLE001
+        logger.exception("Relay publisher worker failed")
+    finally:
+        loop.close()
+        logger.info("Relay publisher worker stopped")
 
 
 def _run_expose_server_socket(
@@ -1225,9 +1439,9 @@ class HoloViewer(ABC):
         expose_port: Optional[int] = None,
         scribe_addr: Optional[str] = None,
     ) -> None:
-        # headless + expose-port 时无需本地窗口，可不依赖 cv2；其余模式需要 cv2 做窗口/显示
-        _expose, _scribe, _headless, _, _, _, _cli_w, _cli_h = parse_network_args()
-        need_cv2 = not (_expose is not None and _headless)
+        # headless + expose-port / --signaling 时无需本地窗口，可不依赖 cv2；其余模式需要 cv2 做窗口/显示
+        _expose, _scribe, _headless, _, _, _, _cli_w, _cli_h, _sig, _ = parse_network_args()
+        need_cv2 = not ((_expose is not None or _sig is not None) and _headless)
         if need_cv2 and cv2 is None:
             raise RuntimeError(
                 "OpenCV (cv2) is required. Install via pip install opencv-python or opencv-python-headless."
@@ -1309,19 +1523,30 @@ class HoloViewer(ABC):
         """Override to control axes overlay. Default: self._show_axes_flag."""
         return self._show_axes_flag
 
-    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str], bool, bool, bool, Optional[int], Optional[int]]:
-        """Return (expose_port, scribe_addr, headless, use_webrtc, no_compress, width, height). If not set in __init__, parse from sys.argv."""
+    def _get_network_mode(self) -> Tuple[Optional[int], Optional[str], bool, bool, bool, Optional[int], Optional[int], Optional[str], Optional[str]]:
+        """Return (expose_port, scribe_addr, headless, use_webrtc, no_compress, width, height, signaling_url, room_id).
+        If not set in __init__, parse from sys.argv."""
         expose = self._expose_port
         scribe = self._scribe_addr
         if expose is None and scribe is None:
-            expose, scribe, headless, use_webrtc, no_compress, _, width, height = parse_network_args()
+            expose, scribe, headless, use_webrtc, no_compress, _, width, height, sig_url, room_id = parse_network_args()
         else:
-            _, _, headless, use_webrtc, no_compress, _, width, height = parse_network_args()
-        return expose, scribe, headless, use_webrtc, no_compress, width, height
+            _, _, headless, use_webrtc, no_compress, _, width, height, sig_url, room_id = parse_network_args()
+        return expose, scribe, headless, use_webrtc, no_compress, width, height, sig_url, room_id
 
     def run(self) -> None:
         _ensure_console_logging()
-        expose_port, scribe_addr, headless, use_webrtc, no_compress, cli_width, cli_height = self._get_network_mode()
+        (
+            expose_port,
+            scribe_addr,
+            headless,
+            use_webrtc,
+            no_compress,
+            cli_width,
+            cli_height,
+            signaling_url,
+            room_id,
+        ) = self._get_network_mode()
         if scribe_addr and cli_width is not None and cli_height is not None:
             self.width = max(64, min(4096, cli_width))
             self.height = max(64, min(4096, cli_height))
@@ -1331,6 +1556,17 @@ class HoloViewer(ABC):
                 self._run_scribe_webrtc(scribe_addr)
             else:
                 self._run_scribe_socket(scribe_addr, no_compress=no_compress)
+            return
+        if signaling_url is not None:
+            if not room_id:
+                raise RuntimeError("--signaling requires --room-id <ID>")
+            if expose_port is not None:
+                raise RuntimeError("--signaling and --expose-port are mutually exclusive")
+            logger.info(
+                "Relay publisher mode: signaling=%s room=%s%s (WebRTC, always)",
+                signaling_url, room_id, " (headless)" if headless else "",
+            )
+            self._run_signaling_webrtc(signaling_url, room_id, headless=headless)
             return
         if expose_port is not None:
             logger.info("Expose mode: WebSocket server on port %s%s%s", expose_port, " (headless)" if headless else "", " [WebRTC]" if use_webrtc else " [WebSocket]")
@@ -1674,6 +1910,43 @@ class HoloViewer(ABC):
         )
         server_thread.start()
         logger.info("WebSocket server thread started (port=%s); main thread running %s", port, "headless render loop" if headless else "render loop")
+        try:
+            if headless:
+                import signal
+                signal.signal(signal.SIGINT, lambda *a: stop_ev.set())
+                self._run_local_headless(
+                    frame_queue_for_stream=frame_queue,
+                    camera_command_queue=camera_command_queue,
+                    stop_ev=stop_ev,
+                )
+            else:
+                self._run_local(
+                    frame_queue_for_stream=frame_queue,
+                    yield_to_ws_thread=True,
+                    camera_command_queue=camera_command_queue,
+                )
+        finally:
+            stop_ev.set()
+
+    def _run_signaling_webrtc(self, signaling_url: str, room_id: str, headless: bool = False) -> None:
+        """本地渲染 + WebRTC publisher 中转模式（主动连中央信令 wss，适合公网部署）。
+        与 _run_expose_webrtc 同体，只是把"被动 ws server"换成"主动 ws client"。
+        """
+        if not _STREAM_AVAILABLE:
+            raise RuntimeError("Relay publisher mode requires: pip install holoviewer[stream] (websockets, aiortc, av)")
+        frame_queue: "Queue[FramePacket]" = Queue(maxsize=2)
+        camera_command_queue: "Queue[CameraCommand]" = Queue(maxsize=8)
+        stop_ev = threading.Event()
+        worker_thread = threading.Thread(
+            target=_run_relay_publisher_webrtc,
+            args=(signaling_url, room_id, frame_queue, stop_ev, camera_command_queue, self),
+            daemon=True,
+        )
+        worker_thread.start()
+        logger.info(
+            "Relay publisher thread started (signaling=%s room=%s); main thread running %s",
+            signaling_url, room_id, "headless render loop" if headless else "render loop",
+        )
         try:
             if headless:
                 import signal

@@ -40,13 +40,16 @@ pip install -e ".[sample,stream]"   # stream 含 websockets + aiortc/av（socket
 # 默认：WebSocket socket 模式（视频+操控同一条连接，适合 SSH 隧道等跨网）
 python sample.py --expose-port 1145
 python sample.py --subscribe 192.168.1.100:1145
-# 可选：WebRTC 模式（适合局域网；跨网需自建 TURN）
+# 可选：WebRTC direct 模式（publisher 自起 ws server，适合局域网/SSH 隧道）
 python sample.py --expose-port 1145 --webrtc
 python sample.py --subscribe 192.168.1.100:1145 --webrtc
+# 可选：WebRTC relay 模式（publisher 主动连中央信令 wss，适合公网 HTTPS 部署 + NAT 后 publisher）
+python sample.py --signaling wss://4d.kiriengine.com/api/holoviewer/signal --room-id A1B2C3D4 --headless
 ```
 
 - **默认 socket 模式**：`--expose-port` 在指定端口启动 WebSocket 服务，经同一条连接推送 H.264 帧并接收 JSON 操控。`--scribe HOST:PORT` 连接后只收帧、不本地渲染。无需 TURN，可经 SSH 反向隧道等跨网使用。
-- **`--webrtc`**：改用 WebRTC 推流（信令 WebSocket + 媒体 ICE）。适合局域网；跨网需公网 TURN。
+- **`--webrtc` (direct)**：改用 WebRTC 推流（信令 WebSocket + 媒体 ICE）。适合局域网；浏览器端写死 `ws://`，HTTPS 公网页面会被 mixed-content 挡。
+- **`--signaling URL --room-id ID` (relay)**：WebRTC publisher 中转模式。本端主动连中央信令 wss，注册到房间号；subscriber 也连同一个房间号即可建链。`room-id` 即权限凭证（capability token），自己保证足够长且随机。媒体面仍是 DTLS-SRTP P2P，没穿过 NAT 时需要 TURN。HoloViewerJS 端用 `signalingUrl + roomId` 配对。
 - **`--headless`**：与 `--expose-port` 同用时不创建 cv2 窗口，仅跑渲染与推流。
 - **视口尺寸（可反复发送）**：订阅端用 `--width W --height H` 指定窗口尺寸；该尺寸会随 control 消息发给服务端（连接后立即发一条，之后每帧 control 也带 `width`/`height`）。headless 服务端按客户端发来的尺寸渲染，因此服务端出图分辨率与客户端窗口一致。未来其他客户端（如 Web）可直接读实时窗口尺寸并发送，协议已支持。
 
