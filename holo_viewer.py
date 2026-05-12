@@ -1036,7 +1036,15 @@ def _run_expose_server_socket(
                         except Exception:
                             break
 
-                await asyncio.gather(send_frames(), recv_control())
+                async def send_stats() -> None:
+                    while not stop.is_set():
+                        await asyncio.sleep(1.0)
+                        try:
+                            await websocket.send(json_mod.dumps({"type": "server_stats", "render_fps": float(getattr(v, "_render_fps", 0.0))}))
+                        except Exception:
+                            break
+
+                await asyncio.gather(send_frames(), recv_control(), send_stats())
             except Exception as e:
                 logger.warning("Socket handler error: %s", e)
             finally:
@@ -1474,6 +1482,8 @@ class HoloViewer(ABC):
         self.time_step = 0.02
         self.sim_time = 0.0
         self.playing = True
+        self._render_fps = 0.0  # exposed to streaming clients via server_stats; updated by render loops
+        self._render_fps_counter = {"frames": 0, "t_last": 0.0}
         self._dragging = False
         self._pan_dragging = False
         self._last_mouse = (0, 0)
@@ -2073,6 +2083,7 @@ class HoloViewer(ABC):
                     frame_queue_for_stream.put_nowait((img_bgr.copy(), self.sim_time, frame_input_ts))
                 except Exception:
                     pass
+                self._tick_render_fps()
                 time.sleep(0.001)
         except Exception:
             logger.exception("Headless render loop error")
@@ -2435,6 +2446,7 @@ class HoloViewer(ABC):
                         frame_queue_for_stream.put_nowait((img_bgr.copy(), self.sim_time, frame_input_ts))
                     except Exception:
                         pass
+                self._tick_render_fps()
                 cv2.imshow(self.window_name, img_bgr)
                 if yield_to_ws_thread:
                     time.sleep(0.001)
@@ -2701,6 +2713,20 @@ class HoloViewer(ABC):
         self.sim_time = wrap_time(
             self.sim_time + delta, self.time_min, self.time_max
         )
+
+    def _tick_render_fps(self) -> None:
+        """Count one rendered frame; refresh `_render_fps` once per second. Called by render loops."""
+        c = self._render_fps_counter
+        c["frames"] += 1
+        now = time.monotonic()
+        if c["t_last"] == 0.0:
+            c["t_last"] = now
+            return
+        elapsed = now - c["t_last"]
+        if elapsed >= 1.0:
+            self._render_fps = c["frames"] / elapsed
+            c["frames"] = 0
+            c["t_last"] = now
     
     def _compute_time_delta(self, dt: float) -> float:
         """
