@@ -4,7 +4,12 @@
 from holoviewer import HoloViewer, is_client
 
 if not is_client():
-    import torch, numpy as np, cv2
+    import torch, numpy as np, cv2, platform
+
+    def _detect_hw():
+        if torch.cuda.is_available(): return f"GPU: {torch.cuda.get_device_name(0)}"
+        try: return "CPU: " + next(l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name"))
+        except Exception: return f"CPU: {platform.processor() or platform.machine()}"
 
     class SampleRenderer:
         def __init__(self, world_up=(0, 0, 1)):
@@ -16,6 +21,7 @@ if not is_client():
             self._t_last = 0.0
             self._disc = [self._make_disc(c) for c in np.array([[255]*3, [216]*3, [176]*3], dtype=np.uint8)]
             self._sky_cache = None; self._frame_buf = None
+            self._hw_label = _detect_hw()
 
         @staticmethod
         def _make_disc(base_bgr, n=256):
@@ -129,6 +135,11 @@ if not is_client():
                 if clip[i, 3] <= 0 or depth[i] < 0.01 or ndc[i, 2] > 1.0: continue
                 self._blit(img, self._disc[i], (ndc[i, 0]*0.5+0.5)*W, (ndc[i, 1]*0.5+0.5)*H,
                            max(2, int(self._body_radius[i] * fy / depth[i])))
+
+            # hardware label, bottom-right with 1px black shadow for legibility on any background
+            tw = cv2.getTextSize(self._hw_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0][0]
+            for dx, dy, c in ((1, 1, (0, 0, 0)), (0, 0, (210, 210, 210))):
+                cv2.putText(img, self._hw_label, (W - tw - 10 + dx, H - 10 + dy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, c, 1, cv2.LINE_AA)
 
             # uint8 BGR HWC → float32 RGB CHW [0, 1] into a reused buffer (one copy, one multiply-cast).
             chw = np.ascontiguousarray(img[:, :, ::-1].transpose(2, 0, 1))
