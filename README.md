@@ -19,11 +19,11 @@ pip install -e Utils/HoloViewerPy
 
 ## 示例
 
-用 PyVista（VTK）渲染一个立方体，支持多 GPU 后端（macOS Metal、Linux Vulkan、Windows DX12 等）：
+`sample.py` 用 numpy + cv2 渲染一个三体引力运动场景。**零 GL 上下文依赖** — 不需要 X / EGL / OSMesa / GPU，全平台 headless 即开即用：
 
 ```bash
 cd packages/HoloViewerPy
-pip install -e ".[sample]"   # 或 pip install -e . && pip install pyvista
+pip install -e .
 python sample.py
 ```
 
@@ -36,7 +36,7 @@ python sample.py
 安装流扩展后，子类无需改代码即可通过命令行切换模式：
 
 ```bash
-pip install -e ".[sample,stream]"   # stream 含 websockets + aiortc/av（socket 与 WebRTC 均需）
+pip install -e ".[stream]"   # stream 含 websockets + aiortc/av（socket 与 WebRTC 均需）
 # 默认：WebSocket socket 模式（视频+操控同一条连接，适合 SSH 隧道等跨网）
 python sample.py --expose-port 1145
 python sample.py --subscribe 192.168.1.100:1145

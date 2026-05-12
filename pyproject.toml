@@ -19,9 +19,6 @@ dev = [
     "black",
     "ruff",
 ]
-sample = [
-    "pyvista",
-]
 stream = [
     "websockets>=12.0",
     "aiortc>=1.6",
