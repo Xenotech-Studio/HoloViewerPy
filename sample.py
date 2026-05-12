@@ -59,7 +59,7 @@ if not is_client():
                 r2 = (d * d).sum(2) + 0.08**2; np.fill_diagonal(r2, 1)
                 r = np.sqrt(r2)
                 f = 0.5 * self._body_mass[None] / (r * r2)
-                f -= 0.001 / (r2**3 * self._body_mass[:, None])  # soft Plummer repulsion, no cutoff, F~1/r⁵ at large r so it fades fast and only really fights gravity near r→0
+                gap = np.maximum(0.40 - r, 0); f -= 3000.0 * gap * gap / (r * self._body_mass[:, None])
                 np.fill_diagonal(f, 0)
                 return (f[..., None] * d).sum(1) - 0.15 * p
             t, te = self._t_last, self._t_last + (sim_time - self._t_last) * 0.5
