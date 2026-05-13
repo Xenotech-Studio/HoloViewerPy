@@ -646,11 +646,29 @@ def _run_expose_server(
                     def on_datachannel(channel: Any) -> None:
                         if getattr(channel, "label", "") == "input":
                             meta_channel_holder[0] = channel
+                            @channel.on("open")
+                            def on_open() -> None:
+                                # DC 建链立刻反向汇报当前服务端速度乘数给客户端，
+                                # 让 UI slider 一上来就跟服务端实际状态对齐。
+                                try:
+                                    cur_mul = v.move_speed / v._move_speed_base if v._move_speed_base else 1.0
+                                    channel.send(__import__("json").dumps({
+                                        "type": "server_state",
+                                        "move_speed_mul": cur_mul,
+                                    }))
+                                except Exception:
+                                    pass
                             @channel.on("message")
                             def on_message(message: Any) -> None:
                                 nonlocal remote_pos, remote_yaw, remote_pitch
                                 try:
                                     recv_data = __import__("json").loads(message) if isinstance(message, str) else __import__("json").loads(message.decode("utf-8"))
+                                    # 独立 config 消息（客户端拖滑块时一次性推过来）：直接覆盖 v.move_speed
+                                    if recv_data.get("type") == "config":
+                                        mul = recv_data.get("move_speed_mul")
+                                        if isinstance(mul, (int, float)) and mul > 0:
+                                            v.move_speed = v._move_speed_base * max(0.05, min(20.0, float(mul)))
+                                        return
                                     w_raw, h_raw = recv_data.get("width"), recv_data.get("height")
                                     if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
                                         # libx264 + yuv420p 要求宽高双数；浏览器全屏时常给奇数高度
@@ -862,6 +880,18 @@ def _run_relay_publisher_webrtc(
                     return
                 meta_channel_holder[0] = channel
 
+                @channel.on("open")
+                def on_open() -> None:
+                    # DC 建链时反向汇报当前服务端速度乘数，让 UI 上来就和服务端对齐
+                    try:
+                        cur_mul = viewer.move_speed / viewer._move_speed_base if viewer._move_speed_base else 1.0
+                        channel.send(json_mod.dumps({
+                            "type": "server_state",
+                            "move_speed_mul": cur_mul,
+                        }))
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 @channel.on("message")
                 def on_message(message: Any) -> None:
                     nonlocal remote_pos, remote_yaw, remote_pitch
@@ -870,6 +900,12 @@ def _run_relay_publisher_webrtc(
                             recv_data = json_mod.loads(message)
                         else:
                             recv_data = json_mod.loads(message.decode("utf-8"))
+                        # 独立 config 消息：拖滑块时一次性，直接覆盖 viewer.move_speed
+                        if recv_data.get("type") == "config":
+                            mul = recv_data.get("move_speed_mul")
+                            if isinstance(mul, (int, float)) and mul > 0:
+                                viewer.move_speed = viewer._move_speed_base * max(0.05, min(20.0, float(mul)))
+                            return
                         w_raw = recv_data.get("width")
                         h_raw = recv_data.get("height")
                         if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
@@ -1650,6 +1686,9 @@ class HoloViewer(ABC):
         self.fov_y_deg = fov_y_deg
         self.pan_sensitivity = pan_sensitivity
         self.move_speed = move_speed
+        # 记构造时的初值，作为远端订阅端"1.0×"速度乘数的参考点；订阅端拉滑块时
+        # 服务端直接覆盖 self.move_speed = _move_speed_base * mul。
+        self._move_speed_base = move_speed
         self.arrow_rotate_speed = arrow_rotate_speed
         self.show_axes = show_axes
         self.play_rate = 1.0
