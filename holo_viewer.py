@@ -51,6 +51,40 @@ try:
     from aiortc import RTCConfiguration, RTCIceCandidate, RTCIceServer, RTCPeerConnection, RTCSessionDescription
     from aiortc.contrib.media import MediaBlackhole
     from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
+    # aiortc 默认 H.264 1Mbps / 上限 3Mbps / level 3.1（720p 上限）/ baseline profile，
+    # 1080p+ 直接糊。对齐 socket 模式 no_compress 档：把上限拉到 20Mbps，level 拉到 5.1（4K30），
+    # 顺手把 profile 升 main 提编码效率（同码率画质更好；只要订阅端 H.264 解码不挑老硬件
+    # 都支持）。monkey-patch 模块常量必须在创建 encoder 之前生效。
+    import aiortc.codecs.h264 as _h264codec  # type: ignore
+    import aiortc.codecs.vpx as _vp8codec  # type: ignore
+    _h264codec.DEFAULT_BITRATE = 5_000_000
+    _h264codec.MAX_BITRATE = 20_000_000
+    _vp8codec.DEFAULT_BITRATE = 5_000_000
+    _vp8codec.MAX_BITRATE = 20_000_000
+
+    def _patched_create_h264_encoder(codec_name, width, height, bitrate):
+        import fractions as _frac
+        is_omx = codec_name == "h264_omx"
+        codec = av.CodecContext.create(codec_name, "w")
+        codec.width = width
+        codec.height = height
+        codec.bit_rate = bitrate
+        codec.pix_fmt = "yuv420p"
+        codec.framerate = _frac.Fraction(_h264codec.MAX_FRAME_RATE, 1)
+        codec.time_base = _frac.Fraction(1, _h264codec.MAX_FRAME_RATE)
+        if is_omx:
+            # OMX 硬编平台保持 aiortc 原选项，避免兼容性问题
+            codec.options = {"profile": "baseline", "level": "31", "tune": "zerolatency"}
+        else:
+            codec.options = {
+                "profile": "main",       # 比 baseline 编码效率高（同码率画质更好）
+                "level": "51",           # 4K30 上限，覆盖任何桌面视口
+                "tune": "zerolatency",
+                "rc_lookahead": "0",
+            }
+        codec.open()
+        return codec, is_omx
+    _h264codec.create_encoder_context = _patched_create_h264_encoder
     _STREAM_AVAILABLE = True
 except ImportError:
     asyncio = None  # type: ignore
