@@ -657,8 +657,11 @@ def _run_expose_server(
                                     init_remote()
                                     pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
                                     remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                                    # 透传客户端 __input_ts 供 _run_local_headless 写进 frame_packet[2]，
+                                    # 进而由 QueueVideoTrack 通过 DC echo 回客户端测延迟。
+                                    ts = recv_data.get("__input_ts")
                                     try:
-                                        cam_queue.put_nowait((pos, yaw, pitch, None))
+                                        cam_queue.put_nowait((pos, yaw, pitch, ts if isinstance(ts, (int, float)) else None))
                                     except Exception:
                                         pass
                                 except Exception:
@@ -875,8 +878,9 @@ def _run_relay_publisher_webrtc(
                             remote_pos, remote_yaw, remote_pitch, recv_data
                         )
                         remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                        ts = recv_data.get("__input_ts")
                         try:
-                            camera_command_queue.put_nowait((pos, yaw, pitch, None))
+                            camera_command_queue.put_nowait((pos, yaw, pitch, ts if isinstance(ts, (int, float)) else None))
                         except Exception:  # noqa: BLE001
                             pass
                     except Exception:  # noqa: BLE001
