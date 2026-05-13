@@ -120,6 +120,10 @@ def _default_rtc_configuration() -> Any:
         return None
     return RTCConfiguration(
         iceServers=[
+            # 实测从国内 cloud 出站：miwifi 47ms、bilibili 43ms、google 159ms。多服务并行
+            # 询问，最先回的胜出。stun.qq.com 实测无 STUN 服务（3s timeout），已剔除。
+            RTCIceServer(urls="stun:stun.miwifi.com:3478"),
+            RTCIceServer(urls="stun:stun.chat.bilibili.com:3478"),
             RTCIceServer(urls="stun:stun.l.google.com:19302"),
             RTCIceServer(urls="stun:stun1.l.google.com:19302"),
         ]
