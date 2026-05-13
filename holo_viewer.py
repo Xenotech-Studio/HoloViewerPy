@@ -2253,11 +2253,13 @@ class HoloViewer(ABC):
                 frame_input_ts: Optional[float] = None
                 if remote_cam is not None:
                     pos, yaw, pitch = remote_cam[0].astype(np.float64).copy(), remote_cam[1], remote_cam[2]
-                    frame_input_ts = remote_cam[3]
-                    if isinstance(frame_input_ts, (int, float)):
-                        last_frame_input_ts = float(frame_input_ts)
-                if frame_input_ts is None:
-                    frame_input_ts = last_frame_input_ts
+                    raw_ts = remote_cam[3]
+                    if isinstance(raw_ts, (int, float)):
+                        frame_input_ts = float(raw_ts)
+                # 不做 sticky fallback：上一任订阅者的 ts 时间基可能与本任不同
+                # （前任 python time.time()，本任浏览器 performance.now()/1000），
+                # 跨基减法会得出几十亿 ms 的负数。宁可这一帧不发 frame_meta，
+                # 让客户端跳过一次 onLatency 更新，也不要发"错位的 ts"。
                 now = time.time()
                 dt = now - last
                 last = now
@@ -2437,12 +2439,12 @@ class HoloViewer(ABC):
                         pass
                     if remote_cam is not None:
                         pos, yaw, pitch = remote_cam[0].astype(np.float64).copy(), remote_cam[1], remote_cam[2]
-                        frame_input_ts = remote_cam[3]
-                        if isinstance(frame_input_ts, (int, float)):
-                            last_frame_input_ts = float(frame_input_ts)
+                        raw_ts = remote_cam[3]
+                        if isinstance(raw_ts, (int, float)):
+                            frame_input_ts = float(raw_ts)
                         use_remote_camera = True
-                if frame_input_ts is None:
-                    frame_input_ts = last_frame_input_ts
+                # 不做 sticky fallback：跨订阅者会泄漏旧 ts 时间基，导致客户端算出
+                # 巨大负值（见 _run_local_headless 同位置注释）。
 
                 move = np.zeros(3, dtype=np.float64)
                 speed = self.move_speed
