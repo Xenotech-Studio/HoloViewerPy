@@ -65,6 +65,55 @@ except ImportError:
     candidate_to_sdp = None  # type: ignore
 
 
+# ===== 中转信令默认配置（订阅端零心智负担：渲染端自动注册到中央信令）=====
+
+_DEFAULT_RELAY_SIGNALING_URL = "wss://kiri4d.xenotech.studio/api/holoviewer/signal"
+
+
+def _get_relay_signaling_url() -> str:
+    """中央信令 ws 地址。默认指 kiri4d.xenotech.studio；
+    `HOLOVIEWER_SIGNALING_URL` 环境变量可在 dev 期覆盖（如 ws://127.0.0.1:9003/api/holoviewer/signal）。
+    """
+    import os
+    return os.environ.get("HOLOVIEWER_SIGNALING_URL", _DEFAULT_RELAY_SIGNALING_URL).rstrip("/")
+
+
+def _http_origin_from_ws(ws_url: str) -> Optional[str]:
+    """wss:// → https:// + host[:port]; ws:// → http://...；用来构造同源 REST 端点。"""
+    if ws_url.startswith("wss://"):
+        return "https://" + ws_url[len("wss://") :].split("/", 1)[0]
+    if ws_url.startswith("ws://"):
+        return "http://" + ws_url[len("ws://") :].split("/", 1)[0]
+    return None
+
+
+def _discover_public_ip(timeout: float = 5.0) -> Optional[str]:
+    """通过中央 backend 的 /api/holoviewer/whoami 拿自己公网 IP（最准——
+    后端看到的就是订阅端将来看到的源 IP）。失败返回 None，调用方应继续走 direct-only 路径。
+    `HOLOVIEWER_PUBLIC_IP` 环境变量可强制覆盖（dev 期机器经 loopback 连本地后端、whoami
+    返回 127.0.0.1 时使用）。
+    """
+    import os
+    override = (os.environ.get("HOLOVIEWER_PUBLIC_IP") or "").strip()
+    if override:
+        return override
+    try:
+        import json as _json
+        from urllib.request import Request, urlopen
+
+        origin = _http_origin_from_ws(_get_relay_signaling_url())
+        if origin is None:
+            return None
+        url = f"{origin}/api/holoviewer/whoami"
+        with urlopen(Request(url), timeout=timeout) as resp:  # noqa: S310
+            data = _json.loads(resp.read().decode("utf-8"))
+        ip = (data.get("ip") or "").strip()
+        return ip or None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("whoami probe failed: %s; auto-relay registration skipped", e)
+        return None
+
+
 def _default_rtc_configuration() -> Any:
     """WebRTC ICE 配置：使用公共 STUN，便于跨 NAT（如经 SSH 隧道信令、媒体直连）时建立连接。"""
     if not _STREAM_AVAILABLE or RTCConfiguration is None or RTCIceServer is None:
@@ -593,6 +642,7 @@ def _run_relay_publisher_webrtc(
     stop_ev: threading.Event,
     camera_command_queue: "Queue[CameraCommand]",
     viewer: "HoloViewer",
+    identity: Optional[str] = None,
 ) -> None:
     """WebRTC publisher 中转模式：主动连中央信令 wss，注册到 room；每当 subscriber 进入即接受
     其 offer 并回 answer，subscriber 退出后等下一个。与 _run_expose_server 报文格式 1:1 兼容，
@@ -631,6 +681,8 @@ def _run_relay_publisher_webrtc(
     json_mod = __import__("json")
     sep = "&" if "?" in signaling_url else "?"
     url = f"{signaling_url}{sep}room={room_id}&role=publisher"
+    if identity:
+        url = f"{url}&identity={identity}"
 
     async def _serve() -> None:
         backoff = 1.0
@@ -924,8 +976,8 @@ def _run_expose_server_socket(
                             "tune": "zerolatency",
                             "level": "41",
                             "rc_lookahead": "0",  # 禁用 lookahead，降低编码延迟
+                            "profile": "baseline",  # PyAV ≥12 把 .profile 设成只读，改走 options
                         }
-                        codec.profile = "baseline"
                     if codec.bit_rate != bitrate:
                         codec.bit_rate = bitrate
                     pts += 1
@@ -1907,29 +1959,61 @@ class HoloViewer(ABC):
         self._scribe_display_loop(frame_queue, stop_ev, addr, thread, camera_send_queue)
 
     def _run_expose_webrtc(self, port: int, headless: bool = False) -> None:
-        """本地渲染 + WebRTC 服务（--webrtc；适合局域网）。"""
+        """本地渲染 + WebRTC 服务（--webrtc）。
+        除自启 local ws server 外，还会**自动**向中央信令（默认 kiri4d.xenotech.studio）
+        注册一个 relay room，identity = "{公网IP}:{port}"。订阅端只需填 HOST:PORT，
+        前端通过 /api/holoviewer/lookup 自动反查到 room 后走 relay 握手。
+        """
         if not _STREAM_AVAILABLE:
             raise RuntimeError("Expose mode requires: pip install holoviewer[stream] (websockets, aiortc, av)")
+        import uuid as _uuid
+
         frame_queue: "Queue[FramePacket]" = Queue(maxsize=2)
         camera_command_queue: "Queue[CameraCommand]" = Queue(maxsize=8)
         stop_ev = threading.Event()
+
+        # 1) Direct: 局域网/SSH 隧道用，浏览器若能直连这条更轻
         server_thread = threading.Thread(
             target=_run_expose_server,
             args=(port, frame_queue, stop_ev, camera_command_queue, self),
             daemon=True,
         )
         server_thread.start()
-        logger.info("WebSocket server thread started (port=%s); main thread running %s", port, "headless render loop" if headless else "render loop")
+        logger.info("Direct WS server thread started (port=%s)", port)
+
+        # 2) Auto-relay: 始终尝试到中央信令注册，让公网/HTTPS 订阅端无脑可达
+        frame_sinks: list = [frame_queue]
+        public_ip = _discover_public_ip()
+        if public_ip:
+            identity = f"{public_ip}:{port}"
+            room_id = _uuid.uuid4().hex
+            relay_url = _get_relay_signaling_url()
+            relay_queue: "Queue[FramePacket]" = Queue(maxsize=2)
+            relay_thread = threading.Thread(
+                target=_run_relay_publisher_webrtc,
+                args=(relay_url, room_id, relay_queue, stop_ev, camera_command_queue, self),
+                kwargs={"identity": identity},
+                daemon=True,
+            )
+            relay_thread.start()
+            frame_sinks.append(relay_queue)
+            logger.info("Auto-relay: identity=%s room=%s signaling=%s", identity, room_id, relay_url)
+        else:
+            logger.warning("Auto-relay: skipped (whoami failed); only direct ws://%s reachable", port)
+
+        logger.info("Main thread running %s", "headless render loop" if headless else "render loop")
         try:
             if headless:
                 import signal
                 signal.signal(signal.SIGINT, lambda *a: stop_ev.set())
                 self._run_local_headless(
-                    frame_queue_for_stream=frame_queue,
+                    frame_queue_for_stream=frame_sinks,
                     camera_command_queue=camera_command_queue,
                     stop_ev=stop_ev,
                 )
             else:
+                # 非 headless 暂仅推 direct 队列；auto-relay 会因无帧饿死握手但不影响 direct
+                # （若要支持，需把 _run_local 也改成多 sink，与 _run_local_headless 对齐）
                 self._run_local(
                     frame_queue_for_stream=frame_queue,
                     yield_to_ws_thread=True,
@@ -2011,11 +2095,17 @@ class HoloViewer(ABC):
 
     def _run_local_headless(
         self,
-        frame_queue_for_stream: "Queue[FramePacket]",
+        frame_queue_for_stream: Any,
         camera_command_queue: "Queue[CameraCommand]",
         stop_ev: threading.Event,
     ) -> None:
-        """无窗口渲染循环：仅跑渲染管线并向 frame_queue 推帧，相机由 camera_command_queue 驱动（订阅端控制）；无 cv2。"""
+        """无窗口渲染循环：仅跑渲染管线并向 frame sink(s) 推帧，相机由 camera_command_queue 驱动（订阅端控制）；无 cv2。
+        `frame_queue_for_stream` 可为单个 Queue 或 Queue 列表（auto-relay 与本地 expose 并存时各占一个 sink）。
+        """
+        if isinstance(frame_queue_for_stream, list):
+            frame_sinks = frame_queue_for_stream
+        else:
+            frame_sinks = [frame_queue_for_stream]
         self.load_assets()
         pos, initial_forward = self.get_initial_pose()
         pos = pos.astype(np.float64)
@@ -2079,10 +2169,12 @@ class HoloViewer(ABC):
                 if self._show_axes_flag:
                     self.draw_world_axes(img_bgr, full)
                 self.on_frame_draw(img_bgr)
-                try:
-                    frame_queue_for_stream.put_nowait((img_bgr.copy(), self.sim_time, frame_input_ts))
-                except Exception:
-                    pass
+                frame_packet = (img_bgr.copy(), self.sim_time, frame_input_ts)
+                for sink in frame_sinks:
+                    try:
+                        sink.put_nowait(frame_packet)
+                    except Exception:
+                        pass
                 self._tick_render_fps()
                 time.sleep(0.001)
         except Exception:
