@@ -553,10 +553,19 @@ def _run_expose_server(
     class QueueVideoTrack(VideoStreamTrack):
         kind = "video"
 
-        def __init__(self, q: "Queue[FramePacket]", stop: threading.Event) -> None:
+        def __init__(
+            self,
+            q: "Queue[FramePacket]",
+            stop: threading.Event,
+            meta_channel_holder: Optional[List[Any]] = None,
+        ) -> None:
             super().__init__()
             self._queue = q
             self._stop = stop
+            # 用 list 包一层做 mutable holder，handler 收到 datachannel("input") 后写入；
+            # QueueVideoTrack 每编码一帧时若 holder[0] 非 None 就把 input_ts echo 回去，
+            # 浏览器算 now-input_ts 得到 send→display 端到端延迟（≈ motion-to-photon）。
+            self._meta_channel_holder = meta_channel_holder
 
         async def recv(self) -> Any:
             # next_timestamp() 按 30fps 墙钟节拍生成 pts + 自动 sleep 到合适时刻；
@@ -575,7 +584,15 @@ def _run_expose_server(
                         latest = self._queue.get_nowait()
                 except Empty:
                     pass
-                frame_bgr, _, _ = latest
+                frame_bgr, _, frame_input_ts = latest
+                # 通过 DataChannel 回送 frame_meta（同 socket 模式协议）让客户端测延迟。
+                if frame_input_ts is not None and self._meta_channel_holder is not None:
+                    ch = self._meta_channel_holder[0]
+                    if ch is not None and getattr(ch, "readyState", "") == "open":
+                        try:
+                            ch.send(__import__("json").dumps({"type": "frame_meta", "input_ts": frame_input_ts}))
+                        except Exception:
+                            pass
                 av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
                 av_frame.pts = pts
                 av_frame.time_base = time_base
@@ -618,11 +635,13 @@ def _run_expose_server(
                 if msg_type == "offer":
                     logger.info("Creating RTCPeerConnection and video track ...")
                     pc = RTCPeerConnection(_default_rtc_configuration())
-                    frame_track = QueueVideoTrack(q, stop)
+                    meta_channel_holder: List[Any] = [None]  # 由 on_datachannel 回填，供 track 回送 frame_meta
+                    frame_track = QueueVideoTrack(q, stop, meta_channel_holder)
                     pc.addTrack(frame_track)
                     @pc.on("datachannel")
                     def on_datachannel(channel: Any) -> None:
                         if getattr(channel, "label", "") == "input":
+                            meta_channel_holder[0] = channel
                             @channel.on("message")
                             def on_message(message: Any) -> None:
                                 nonlocal remote_pos, remote_yaw, remote_pitch
@@ -726,10 +745,19 @@ def _run_relay_publisher_webrtc(
     class QueueVideoTrack(VideoStreamTrack):
         kind = "video"
 
-        def __init__(self, q: "Queue[FramePacket]", stop: threading.Event) -> None:
+        def __init__(
+            self,
+            q: "Queue[FramePacket]",
+            stop: threading.Event,
+            meta_channel_holder: Optional[List[Any]] = None,
+        ) -> None:
             super().__init__()
             self._queue = q
             self._stop = stop
+            # 用 list 包一层做 mutable holder，handler 收到 datachannel("input") 后写入；
+            # QueueVideoTrack 每编码一帧时若 holder[0] 非 None 就把 input_ts echo 回去，
+            # 浏览器算 now-input_ts 得到 send→display 端到端延迟（≈ motion-to-photon）。
+            self._meta_channel_holder = meta_channel_holder
 
         async def recv(self) -> Any:
             # next_timestamp() 按 30fps 墙钟节拍生成 pts + 自动 sleep 到合适时刻；
@@ -748,7 +776,15 @@ def _run_relay_publisher_webrtc(
                         latest = self._queue.get_nowait()
                 except Empty:
                     pass
-                frame_bgr, _, _ = latest
+                frame_bgr, _, frame_input_ts = latest
+                # 通过 DataChannel 回送 frame_meta（同 socket 模式协议）让客户端测延迟。
+                if frame_input_ts is not None and self._meta_channel_holder is not None:
+                    ch = self._meta_channel_holder[0]
+                    if ch is not None and getattr(ch, "readyState", "") == "open":
+                        try:
+                            ch.send(__import__("json").dumps({"type": "frame_meta", "input_ts": frame_input_ts}))
+                        except Exception:
+                            pass
                 av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
                 av_frame.pts = pts
                 av_frame.time_base = time_base
@@ -809,13 +845,15 @@ def _run_relay_publisher_webrtc(
             nonlocal pc, frame_track, remote_pos, remote_yaw, remote_pitch
             await reset_pc()
             pc = RTCPeerConnection(_default_rtc_configuration())
-            frame_track = QueueVideoTrack(frame_queue, stop_ev)
+            meta_channel_holder: List[Any] = [None]
+            frame_track = QueueVideoTrack(frame_queue, stop_ev, meta_channel_holder)
             pc.addTrack(frame_track)
 
             @pc.on("datachannel")
             def on_datachannel(channel: Any) -> None:  # noqa: ARG001
                 if getattr(channel, "label", "") != "input":
                     return
+                meta_channel_holder[0] = channel
 
                 @channel.on("message")
                 def on_message(message: Any) -> None:
