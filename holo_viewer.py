@@ -150,13 +150,17 @@ def _discover_public_ip(timeout: float = 5.0) -> Optional[str]:
         return override
     try:
         import json as _json
-        from urllib.request import Request, urlopen
+        from urllib.request import Request, ProxyHandler, build_opener
 
         origin = _http_origin_from_ws(_get_relay_signaling_url())
         if origin is None:
             return None
         url = f"{origin}/api/holoviewer/whoami"
-        with urlopen(Request(url), timeout=timeout) as resp:  # noqa: S310
+        # 显式空 ProxyHandler 绕开 HTTP_PROXY / HTTPS_PROXY / NO_PROXY 等环境变量——
+        # 算力机普遍配 corporate / VPN proxy，让 whoami 经它出去会拿到代理出口 IP，
+        # 而我们要的是 backend 看到的 publisher 自身源 IP，必须直连不经任何中转。
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(Request(url), timeout=timeout) as resp:  # noqa: S310
             data = _json.loads(resp.read().decode("utf-8"))
         ip = (data.get("ip") or "").strip()
         return ip or None
