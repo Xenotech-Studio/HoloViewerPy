@@ -557,18 +557,28 @@ def _run_expose_server(
             super().__init__()
             self._queue = q
             self._stop = stop
-            self._pts = 0
 
         async def recv(self) -> Any:
+            # next_timestamp() 按 30fps 墙钟节拍生成 pts + 自动 sleep 到合适时刻；
+            # 比手动 `self._pts += 1` 强：后者只跟"调用次数"挂钩，跟实际 wall clock 脱节，
+            # browser jitter buffer 在 source 帧率漂移时会逐渐累积延迟。
+            pts, time_base = await self.next_timestamp()
             while not self._stop.is_set():
                 try:
-                    frame_bgr, _, _ = self._queue.get(timeout=0.5)
+                    latest = self._queue.get(timeout=0.5)
                 except Empty:
                     continue
-                self._pts += 1
+                # 排空积压（last-frame-wins），保证编码的永远是最新帧，
+                # 渲染端 ~40fps 而 encoder ~30fps 时不会留旧帧。
+                try:
+                    while True:
+                        latest = self._queue.get_nowait()
+                except Empty:
+                    pass
+                frame_bgr, _, _ = latest
                 av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
-                av_frame.pts = self._pts
-                av_frame.time_base = __import__("fractions").Fraction(1, 30)
+                av_frame.pts = pts
+                av_frame.time_base = time_base
                 return av_frame
             raise Exception("track stopped")
 
@@ -720,18 +730,28 @@ def _run_relay_publisher_webrtc(
             super().__init__()
             self._queue = q
             self._stop = stop
-            self._pts = 0
 
         async def recv(self) -> Any:
+            # next_timestamp() 按 30fps 墙钟节拍生成 pts + 自动 sleep 到合适时刻；
+            # 比手动 `self._pts += 1` 强：后者只跟"调用次数"挂钩，跟实际 wall clock 脱节，
+            # browser jitter buffer 在 source 帧率漂移时会逐渐累积延迟。
+            pts, time_base = await self.next_timestamp()
             while not self._stop.is_set():
                 try:
-                    frame_bgr, _, _ = self._queue.get(timeout=0.5)
+                    latest = self._queue.get(timeout=0.5)
                 except Empty:
                     continue
-                self._pts += 1
+                # 排空积压（last-frame-wins），保证编码的永远是最新帧，
+                # 渲染端 ~40fps 而 encoder ~30fps 时不会留旧帧。
+                try:
+                    while True:
+                        latest = self._queue.get_nowait()
+                except Empty:
+                    pass
+                frame_bgr, _, _ = latest
                 av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
-                av_frame.pts = self._pts
-                av_frame.time_base = __import__("fractions").Fraction(1, 30)
+                av_frame.pts = pts
+                av_frame.time_base = time_base
                 return av_frame
             raise Exception("track stopped")
 
