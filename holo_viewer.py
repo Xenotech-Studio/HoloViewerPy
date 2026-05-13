@@ -76,15 +76,32 @@ try:
             # OMX 硬编平台保持 aiortc 原选项，避免兼容性问题
             codec.options = {"profile": "baseline", "level": "31", "tune": "zerolatency"}
         else:
+            # 试过 main profile：第一帧清晰但 P 帧编码后画面卡死/掉线（猜测 aiortc RTP
+            # packetizer 对 main NAL 类型支持不全）。退回 baseline + 更大 keyframe 间隔，
+            # 与 socket 模式 [holo_viewer.py:921-928] 同档，已被实测验证可稳跑。
             codec.options = {
-                "profile": "main",       # 比 baseline 编码效率高（同码率画质更好）
-                "level": "51",           # 4K30 上限，覆盖任何桌面视口
+                "profile": "baseline",
+                "level": "51",           # 4K30 上限（baseline 也支持高 level）
                 "tune": "zerolatency",
                 "rc_lookahead": "0",
+                "bf": "0",                # 显式禁 B 帧（tune=zerolatency 默认 0，但保险起见）
+                "keyint": "60",           # 每 ~2s 一个 IDR，新订阅者切入也快
+                "keyint_min": "60",
             }
         codec.open()
         return codec, is_omx
     _h264codec.create_encoder_context = _patched_create_h264_encoder
+
+    # 强制 H.264：从能力列表里移除 VP8。aiortc 的 VP8 上限 1.5Mbps（即使把 MAX_BITRATE 提到 20M，
+    # 实际 BWE 也只到几 Mbps），1080p 必糊。Chrome 一直支持 H.264，移除 VP8 没兼容性损失。
+    import aiortc.codecs as _aiortc_codecs  # type: ignore
+    _video_caps = _aiortc_codecs.CODECS.get("video", [])
+    _vp8_pts = {c.payloadType for c in _video_caps if getattr(c, "mimeType", "") == "video/VP8"}
+    _aiortc_codecs.CODECS["video"] = [
+        c for c in _video_caps
+        if c.mimeType != "video/VP8"
+        and not (c.mimeType == "video/rtx" and c.parameters.get("apt") in _vp8_pts)
+    ]
     _STREAM_AVAILABLE = True
 except ImportError:
     asyncio = None  # type: ignore
@@ -603,7 +620,9 @@ def _run_expose_server(
                                     recv_data = __import__("json").loads(message) if isinstance(message, str) else __import__("json").loads(message.decode("utf-8"))
                                     w_raw, h_raw = recv_data.get("width"), recv_data.get("height")
                                     if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
-                                        w, h = max(64, min(4096, int(w_raw))), max(64, min(4096, int(h_raw)))
+                                        # libx264 + yuv420p 要求宽高双数；浏览器全屏时常给奇数高度
+                                        w = max(64, min(4096, int(w_raw))) & ~1
+                                        h = max(64, min(4096, int(h_raw))) & ~1
                                         v._remote_render_size = [w, h]
                                         logger.info("Viewport resize from client: %dx%d", w, h)
                                     init_remote()
@@ -789,8 +808,9 @@ def _run_relay_publisher_webrtc(
                         w_raw = recv_data.get("width")
                         h_raw = recv_data.get("height")
                         if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
-                            w = max(64, min(4096, int(w_raw)))
-                            h = max(64, min(4096, int(h_raw)))
+                            # libx264 + yuv420p 要求宽高双数；浏览器全屏时常给奇数高度
+                            w = max(64, min(4096, int(w_raw))) & ~1
+                            h = max(64, min(4096, int(h_raw))) & ~1
                             viewer._remote_render_size = [w, h]
                         init_remote()
                         pos, yaw, pitch = viewer._apply_input(
