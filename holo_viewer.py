@@ -493,7 +493,7 @@ def parse_network_args(argv: Optional[List[str]] = None) -> Tuple[Optional[int],
     parser.add_argument("--scribe", type=str, default=None, metavar="HOST:PORT", help="Connect to remote HOST:PORT and display stream (no local render)")
     parser.add_argument("--subscribe", type=str, default=None, metavar="HOST:PORT or PORT", help="Same as --scribe; if only PORT, use 127.0.0.1:PORT")
     parser.add_argument("--headless", action="store_true", help="No cv2 window; use with --expose-port / --signaling to run server and render pipeline only.")
-    parser.add_argument("--webrtc", action="store_true", help="Use WebRTC for streaming (LAN only without TURN); default is WebSocket/socket mode for cross-network (e.g. SSH tunnel)")
+    parser.add_argument("--webrtc", action="store_true", help="(deprecated, ignored) Both WebRTC and socket protocols are now always active on --expose-port")
     parser.add_argument("--no-compress", action="store_true", help="Subscribe: request high quality (no adaptive downscale). Expose: default for clients that do not send prefer.")
     parser.add_argument("--init-view", type=str, default="Z_UP", choices=["Z_UP", "Y_UP", "mY_UP"], metavar="MODE", help="Initial view up axis: Z_UP, Y_UP, mY_UP (default: Z_UP)")
     parser.add_argument("--width", type=int, default=None, metavar="W", help="Subscribe/client: window width; sent to server as viewport_resize for headless render size")
@@ -1288,6 +1288,456 @@ def _run_expose_server_socket(
         logger.info("WebSocket (socket) server stopped")
 
 
+def _run_expose_server_unified(
+    port: int,
+    frame_queue: "Queue[FramePacket]",
+    stop_ev: threading.Event,
+    camera_command_queue: "Queue[CameraCommand]",
+    viewer: "HoloViewer",
+    no_compress: bool = False,
+) -> None:
+    """Unified WebSocket server: 同一端口同时服务 WebRTC 和 socket (H.264) 两种协议。
+
+    连接分发逻辑：WebRTC 客户端（webrtcClient.js）连接后立即发送 SDP offer；
+    socket 客户端（client.js）连接后立即发送 ``{"type":"prefer",...}``。
+    服务端用 0.3s 超时读取首条消息：
+
+    - 收到 ``{"type":"offer"}`` → WebRTC 路径（aiortc + DataChannel）
+    - 其它（含 prefer / timeout）→ socket 路径（H.264 binary + JSON 控制）
+
+    旧的 ``--webrtc`` 参数已被忽略，两种协议始终并行待命。
+    """
+    if not _STREAM_AVAILABLE:
+        return
+    if not _WS_AVAILABLE or websockets is None:
+        logger.error("Unified server requires websockets + aiortc + av")
+        return
+
+    from aiortc.mediastreams import VideoStreamTrack  # type: ignore
+
+    # ── WebRTC video track（同 _run_expose_server）──────────────────
+    class QueueVideoTrack(VideoStreamTrack):
+        kind = "video"
+
+        def __init__(
+            self,
+            q: "Queue[FramePacket]",
+            stop: threading.Event,
+            meta_channel_holder: Optional[List[Any]] = None,
+        ) -> None:
+            super().__init__()
+            self._queue = q
+            self._stop = stop
+            self._meta_channel_holder = meta_channel_holder
+
+        async def recv(self) -> Any:
+            pts, time_base = await self.next_timestamp()
+            while not self._stop.is_set():
+                try:
+                    latest = self._queue.get(timeout=0.5)
+                except Empty:
+                    continue
+                try:
+                    while True:
+                        latest = self._queue.get_nowait()
+                except Empty:
+                    pass
+                frame_bgr, _, frame_input_ts = latest
+                if frame_input_ts is not None and self._meta_channel_holder is not None:
+                    ch = self._meta_channel_holder[0]
+                    if ch is not None and getattr(ch, "readyState", "") == "open":
+                        try:
+                            ch.send(__import__("json").dumps({"type": "frame_meta", "input_ts": frame_input_ts}))
+                        except Exception:
+                            pass
+                av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
+                av_frame.pts = pts
+                av_frame.time_base = time_base
+                return av_frame
+            raise Exception("track stopped")
+
+    # ── WebRTC handler（提取自 _run_expose_server 内联 handler）───────
+    async def _handle_webrtc(websocket: Any, offer_data: dict) -> None:
+        peer = getattr(websocket, "remote_address", None) or "unknown"
+        logger.info("Unified: WebRTC connection from %s", peer)
+        pc: Optional[Any] = None
+        remote_pos: Optional[np.ndarray] = None
+        remote_yaw: Optional[float] = None
+        remote_pitch: Optional[float] = None
+
+        def init_remote() -> None:
+            nonlocal remote_pos, remote_yaw, remote_pitch
+            if remote_pos is not None:
+                return
+            pos, forward = viewer.get_initial_pose()
+            pos = pos.astype(np.float64)
+            forward = forward / (np.linalg.norm(forward) + 1e-9)
+            remote_yaw, remote_pitch = viewer.axis_system.look_dir_to_angles(forward)
+            remote_pos = pos
+
+        try:
+            pc = RTCPeerConnection(_default_rtc_configuration())
+            meta_channel_holder: List[Any] = [None]
+            frame_track = QueueVideoTrack(frame_queue, stop_ev, meta_channel_holder)
+            pc.addTrack(frame_track)
+
+            @pc.on("datachannel")
+            def on_datachannel(channel: Any) -> None:
+                if getattr(channel, "label", "") == "input":
+                    meta_channel_holder[0] = channel
+
+                    @channel.on("open")
+                    def on_open() -> None:
+                        try:
+                            cur_mul = viewer.move_speed / viewer._move_speed_base if viewer._move_speed_base else 1.0
+                            channel.send(__import__("json").dumps({
+                                "type": "server_state",
+                                "move_speed_mul": cur_mul,
+                            }))
+                        except Exception:
+                            pass
+
+                    @channel.on("message")
+                    def on_message(message: Any) -> None:
+                        nonlocal remote_pos, remote_yaw, remote_pitch
+                        try:
+                            recv_data = __import__("json").loads(message) if isinstance(message, str) else __import__("json").loads(message.decode("utf-8"))
+                            if recv_data.get("type") == "config":
+                                mul = recv_data.get("move_speed_mul")
+                                if isinstance(mul, (int, float)) and mul > 0:
+                                    viewer.move_speed = viewer._move_speed_base * max(0.05, min(20.0, float(mul)))
+                                return
+                            w_raw, h_raw = recv_data.get("width"), recv_data.get("height")
+                            if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
+                                w = max(64, min(4096, int(w_raw))) & ~1
+                                h = max(64, min(4096, int(h_raw))) & ~1
+                                viewer._remote_render_size = [w, h]
+                                logger.info("Viewport resize from client: %dx%d", w, h)
+                            init_remote()
+                            pos, yaw, pitch = viewer._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
+                            remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                            ts = recv_data.get("__input_ts")
+                            try:
+                                camera_command_queue.put_nowait((pos, yaw, pitch, ts if isinstance(ts, (int, float)) else None))
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+            logger.info("Setting remote description (offer) ...")
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_data["sdp"], type=offer_data["type"]))
+            logger.info("Creating WebRTC answer ...")
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            answer_msg = __import__("json").dumps({"type": pc.localDescription.type, "sdp": pc.localDescription.sdp})
+            await websocket.send(answer_msg)
+            logger.info("WebRTC answer sent (%d bytes)", len(answer_msg))
+
+            @pc.on("icecandidate")
+            def on_ice(candidate: Any) -> None:
+                if candidate:
+                    cand_str = "candidate:" + candidate_to_sdp(candidate)
+                    asyncio.ensure_future(websocket.send(__import__("json").dumps({
+                        "type": "candidate",
+                        "candidate": cand_str,
+                        "sdpMid": getattr(candidate, "sdpMid", None),
+                        "sdpMLineIndex": getattr(candidate, "sdpMLineIndex", None),
+                    })))
+
+            while not stop_ev.is_set():
+                try:
+                    recv_msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    recv_data = __import__("json").loads(recv_msg)
+                    if recv_data.get("type") == "candidate" and recv_data.get("candidate"):
+                        raw = recv_data["candidate"]
+                        sdp_part = raw.split(":", 1)[1] if isinstance(raw, str) and ":" in raw else raw
+                        c = candidate_from_sdp(sdp_part)
+                        c.sdpMid = recv_data.get("sdpMid")
+                        c.sdpMLineIndex = recv_data.get("sdpMLineIndex")
+                        await pc.addIceCandidate(c)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+        except Exception as e:
+            logger.warning("WebRTC handler error: %s", e)
+        finally:
+            if pc:
+                await pc.close()
+            logger.info("WebRTC client disconnected (peer=%s)", peer)
+
+    # ── Socket handler（提取自 _run_expose_server_socket 内联 handler）─
+    async def _handle_socket(websocket: Any, pending_first: Any) -> None:
+        peer = getattr(websocket, "remote_address", None) or "unknown"
+        logger.info("Unified: socket (H.264) connection from %s", peer)
+        encode_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        remote_pos: Optional[np.ndarray] = None
+        remote_yaw: Optional[float] = None
+        remote_pitch: Optional[float] = None
+
+        def init_remote() -> None:
+            nonlocal remote_pos, remote_yaw, remote_pitch
+            if remote_pos is not None:
+                return
+            pos, forward = viewer.get_initial_pose()
+            pos = pos.astype(np.float64)
+            forward = forward / (np.linalg.norm(forward) + 1e-9)
+            remote_yaw, remote_pitch = viewer.axis_system.look_dir_to_angles(forward)
+            remote_pos = pos
+
+        try:
+            # 先读首条消息（unified dispatcher 已 peek 过，这里拿到 pending_first）
+            connection_no_compress = no_compress
+            pending_first_ref = [pending_first]
+            if pending_first_ref[0] is not None:
+                try:
+                    first_data = __import__("json").loads(pending_first_ref[0]) if isinstance(pending_first_ref[0], str) else None
+                    if first_data and first_data.get("type") == "prefer":
+                        connection_no_compress = bool(first_data.get("no_compress", False))
+                        logger.info("Client requested no_compress=%s", connection_no_compress)
+                    else:
+                        pass  # 非 prefer，后续 recv_control 处理
+                except Exception:
+                    pass
+            else:
+                # Timeout 路径：再给一次机会读 prefer
+                try:
+                    first_msg = await asyncio.wait_for(websocket.recv(), timeout=0.3)
+                    if isinstance(first_msg, str):
+                        first_data = __import__("json").loads(first_msg)
+                        if first_data.get("type") == "prefer":
+                            connection_no_compress = bool(first_data.get("no_compress", False))
+                            logger.info("Client requested no_compress=%s", connection_no_compress)
+                        else:
+                            pending_first_ref[0] = first_msg
+                    else:
+                        pending_first_ref[0] = first_msg
+                except asyncio.TimeoutError:
+                    pass
+
+            # 发送 tunnel greeting
+            await websocket.send(__import__("json").dumps({"type": "tunnel", "version": 1, "codec": "h264"}))
+
+            loop = asyncio.get_running_loop()
+
+            _BITRATE_STEPS = [300_000, 500_000, 700_000, 1_000_000, 1_500_000]
+            _SCALE_STEPS = [0.5, 0.75, 1.0]
+            adaptive = {"bitrate_idx": 4, "scale_idx": 2}
+            _NO_COMPRESS_BITRATE = 20_000_000
+            _KEYFRAME_INTERVAL = 1 if connection_no_compress else 30
+
+            def _get_latest_frame() -> Optional[FramePacket]:
+                latest: Optional[FramePacket] = None
+                try:
+                    latest = frame_queue.get(timeout=0.5)
+                except Empty:
+                    return None
+                while True:
+                    try:
+                        latest = frame_queue.get_nowait()
+                    except Empty:
+                        break
+                return latest
+
+            codec: Optional[Any] = None
+            pts = 0
+            time_base = fractions.Fraction(1, 30)
+
+            def _encode_latest_frame(item: FramePacket, bitrate_idx: int, scale_idx: int) -> bytes:
+                nonlocal codec, pts
+                frame_bgr, _, _ = item
+                h, w = frame_bgr.shape[:2]
+                scale = _SCALE_STEPS[scale_idx]
+                encode_w = max(64, int(w * scale))
+                encode_h = max(64, int(h * scale))
+                if scale < 1.0 and cv2 is not None:
+                    frame_bgr = cv2.resize(frame_bgr, (encode_w, encode_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    encode_w, encode_h = w, h
+                if (encode_w & 1) or (encode_h & 1):
+                    encode_w &= ~1
+                    encode_h &= ~1
+                    if cv2 is not None and (encode_w, encode_h) != frame_bgr.shape[1::-1]:
+                        frame_bgr = cv2.resize(frame_bgr, (encode_w, encode_h), interpolation=cv2.INTER_LINEAR)
+                bitrate = _NO_COMPRESS_BITRATE if connection_no_compress else _BITRATE_STEPS[bitrate_idx]
+                if codec is None or codec.width != encode_w or codec.height != encode_h:
+                    codec = av.CodecContext.create("libx264", "w")
+                    codec.width = encode_w
+                    codec.height = encode_h
+                    codec.pix_fmt = "yuv420p"
+                    codec.time_base = time_base
+                    codec.framerate = fractions.Fraction(30, 1)
+                    codec.bit_rate = bitrate
+                    codec.options = {
+                        "tune": "zerolatency",
+                        "level": "41",
+                        "rc_lookahead": "0",
+                        "profile": "baseline",
+                    }
+                if codec.bit_rate != bitrate:
+                    codec.bit_rate = bitrate
+                pts += 1
+                av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
+                av_frame.pts = pts
+                av_frame.time_base = time_base
+                if pts == 1 or (pts % _KEYFRAME_INTERVAL) == 1:
+                    av_frame.pict_type = av.video.frame.PictureType.I
+                else:
+                    av_frame.pict_type = av.video.frame.PictureType.NONE
+                data = b""
+                for packet in codec.encode(av_frame):
+                    data += bytes(packet)
+                return data
+
+            async def send_frames() -> None:
+                while not stop_ev.is_set():
+                    try:
+                        item = await loop.run_in_executor(None, _get_latest_frame)
+                        if item is None:
+                            continue
+                        data = await loop.run_in_executor(
+                            encode_executor, _encode_latest_frame, item,
+                            adaptive["bitrate_idx"], adaptive["scale_idx"],
+                        )
+                        if item[2] is not None:
+                            await websocket.send(__import__("json").dumps({"type": "frame_meta", "input_ts": item[2]}))
+                        if data:
+                            await websocket.send(data)
+                    except Exception as _send_err:
+                        if isinstance(_send_err, websockets.exceptions.ConnectionClosed):
+                            logger.info("send_frames stopped: %s", _send_err)
+                        else:
+                            logger.exception("send_frames loop dying: %s", _send_err)
+                        break
+
+            async def recv_control() -> None:
+                nonlocal remote_pos, remote_yaw, remote_pitch
+                first_sent = False
+                while not stop_ev.is_set():
+                    try:
+                        if pending_first_ref[0] is not None and not first_sent:
+                            msg = pending_first_ref[0]
+                            pending_first_ref[0] = None
+                            first_sent = True
+                        else:
+                            msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                        if isinstance(msg, str):
+                            recv_data = __import__("json").loads(msg)
+                            msg_type = recv_data.get("type")
+                            if msg_type == "prefer":
+                                continue  # 已处理
+                            if msg_type == "stats":
+                                if not connection_no_compress:
+                                    dropped = recv_data.get("dropped", 0)
+                                    received = max(recv_data.get("received", 0), 1)
+                                    ratio = dropped / received
+                                    if ratio > 0.15:
+                                        if adaptive["bitrate_idx"] > 0:
+                                            adaptive["bitrate_idx"] -= 1
+                                        elif adaptive["scale_idx"] > 0:
+                                            adaptive["scale_idx"] -= 1
+                                    elif ratio < 0.05 and received > 15:
+                                        if adaptive["scale_idx"] < len(_SCALE_STEPS) - 1:
+                                            adaptive["scale_idx"] += 1
+                                        elif adaptive["bitrate_idx"] < len(_BITRATE_STEPS) - 1:
+                                            adaptive["bitrate_idx"] += 1
+                                continue
+                            if msg_type == "viewport_resize":
+                                w = recv_data.get("width")
+                                h = recv_data.get("height")
+                                if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+                                    w, h = int(w), int(h)
+                                    w = max(64, min(4096, w))
+                                    h = max(64, min(4096, h))
+                                    viewer.width, viewer.height = w, h
+                                    logger.info("Viewport resize from client: %dx%d", w, h)
+                                continue
+                            w_raw, h_raw = recv_data.get("width"), recv_data.get("height")
+                            if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
+                                w, h = max(64, min(4096, int(w_raw))), max(64, min(4096, int(h_raw)))
+                                if (viewer.width, viewer.height) != (w, h):
+                                    viewer.width, viewer.height = w, h
+                                    logger.info("Viewport resize from client: %dx%d", w, h)
+                            init_remote()
+                            pos, yaw, pitch = viewer._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
+                            remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                            input_ts_raw = recv_data.get("__input_ts")
+                            input_ts = float(input_ts_raw) if isinstance(input_ts_raw, (int, float)) else None
+                            try:
+                                while True:
+                                    camera_command_queue.get_nowait()
+                            except Empty:
+                                pass
+                            try:
+                                camera_command_queue.put_nowait((pos, yaw, pitch, input_ts))
+                            except Exception:
+                                pass
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        break
+
+            async def send_stats() -> None:
+                while not stop_ev.is_set():
+                    await asyncio.sleep(1.0)
+                    try:
+                        await websocket.send(__import__("json").dumps({"type": "server_stats", "render_fps": float(getattr(viewer, "_render_fps", 0.0))}))
+                    except Exception:
+                        break
+
+            await asyncio.gather(send_frames(), recv_control(), send_stats())
+        except Exception as e:
+            logger.warning("Socket handler error: %s", e)
+        finally:
+            encode_executor.shutdown(wait=False)
+            logger.info("Socket client disconnected (peer=%s)", peer)
+
+    # ── Unified dispatcher ────────────────────────────────────────────
+    async def _unified_handler(websocket: Any) -> None:
+        """根据首条消息分发到 WebRTC 或 socket handler。"""
+        first_msg = None
+        try:
+            first_msg = await asyncio.wait_for(websocket.recv(), timeout=0.3)
+        except asyncio.TimeoutError:
+            pass
+
+        if first_msg is not None:
+            try:
+                data = __import__("json").loads(first_msg)
+                if isinstance(data, dict) and data.get("type") == "offer":
+                    await _handle_webrtc(websocket, data)
+                    return
+            except Exception:
+                pass
+
+        await _handle_socket(websocket, first_msg)
+
+    # ── 启动 ──────────────────────────────────────────────────────────
+    async def _serve_unified() -> None:
+        logger.info("Unified server binding to 0.0.0.0:%s (WebRTC + socket) ...", port)
+        async with websockets.serve(
+            _unified_handler,
+            "0.0.0.0",
+            port,
+            ping_interval=None,
+            ping_timeout=None,
+            close_timeout=1,
+            compression=None,
+            max_queue=1,
+        ):
+            logger.info("Unified server ready on port %s — WebRTC and socket clients both welcome", port)
+            await asyncio.get_running_loop().run_in_executor(None, stop_ev.wait)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_serve_unified())
+    except Exception:
+        logger.exception("Unified expose server failed")
+    finally:
+        loop.close()
+
+
 def _run_scribe_client_webrtc(
     addr: str,
     frame_queue: "Queue[Any]",  # 可放入 np.ndarray | ("error", str) | None
@@ -1794,11 +2244,8 @@ class HoloViewer(ABC):
             self._run_signaling_webrtc(signaling_url, room_id, headless=headless)
             return
         if expose_port is not None:
-            logger.info("Expose mode: WebSocket server on port %s%s%s", expose_port, " (headless)" if headless else "", " [WebRTC]" if use_webrtc else " [WebSocket]")
-            if use_webrtc:
-                self._run_expose_webrtc(expose_port, headless=headless)
-            else:
-                self._run_expose_socket(expose_port, headless=headless, no_compress=no_compress)
+            logger.info("Expose mode: unified server on port %s%s (WebRTC + socket)", expose_port, " (headless)" if headless else "")
+            self._run_expose_unified(expose_port, headless=headless, no_compress=no_compress)
             return
         logger.info("Local mode: running render pipeline")
         self._run_local()
@@ -2121,11 +2568,13 @@ class HoloViewer(ABC):
         thread.start()
         self._scribe_display_loop(frame_queue, stop_ev, addr, thread, camera_send_queue)
 
-    def _run_expose_webrtc(self, port: int, headless: bool = False) -> None:
-        """本地渲染 + WebRTC 服务（--webrtc）。
-        除自启 local ws server 外，还会**自动**向中央信令（默认 kiri4d.xenotech.studio）
+    def _run_expose_unified(self, port: int, headless: bool = False, no_compress: bool = False) -> None:
+        """本地渲染 + 统一服务（WebRTC + socket 双协议同端口待命）。
+
+        除自启 unified ws server 外，还会**自动**向中央信令（默认 kiri4d.xenotech.studio）
         注册一个 relay room，identity = "{公网IP}:{port}"。订阅端只需填 HOST:PORT，
         前端通过 /api/holoviewer/lookup 自动反查到 room 后走 relay 握手。
+        ``--webrtc`` 参数已被忽略——两种协议始终并行。
         """
         if not _STREAM_AVAILABLE:
             raise RuntimeError("Expose mode requires: pip install holoviewer[stream] (websockets, aiortc, av)")
@@ -2135,14 +2584,14 @@ class HoloViewer(ABC):
         camera_command_queue: "Queue[CameraCommand]" = Queue(maxsize=8)
         stop_ev = threading.Event()
 
-        # 1) Direct: 局域网/SSH 隧道用，浏览器若能直连这条更轻
+        # 1) Unified direct: 同一端口同时接受 WebRTC 和 socket (H.264) 客户端
         server_thread = threading.Thread(
-            target=_run_expose_server,
-            args=(port, frame_queue, stop_ev, camera_command_queue, self),
+            target=_run_expose_server_unified,
+            args=(port, frame_queue, stop_ev, camera_command_queue, self, no_compress),
             daemon=True,
         )
         server_thread.start()
-        logger.info("Direct WS server thread started (port=%s)", port)
+        logger.info("Unified WS server thread started (port=%s)", port)
 
         # 2) Auto-relay: 始终尝试到中央信令注册，让公网/HTTPS 订阅端无脑可达
         frame_sinks: list = [frame_queue]
@@ -2175,10 +2624,8 @@ class HoloViewer(ABC):
                     stop_ev=stop_ev,
                 )
             else:
-                # 非 headless 暂仅推 direct 队列；auto-relay 会因无帧饿死握手但不影响 direct
-                # （若要支持，需把 _run_local 也改成多 sink，与 _run_local_headless 对齐）
                 self._run_local(
-                    frame_queue_for_stream=frame_queue,
+                    frame_queue_for_stream=frame_sinks if len(frame_sinks) > 1 else frame_queue,
                     yield_to_ws_thread=True,
                     camera_command_queue=camera_command_queue,
                 )
@@ -2187,7 +2634,7 @@ class HoloViewer(ABC):
 
     def _run_signaling_webrtc(self, signaling_url: str, room_id: str, headless: bool = False) -> None:
         """本地渲染 + WebRTC publisher 中转模式（主动连中央信令 wss，适合公网部署）。
-        与 _run_expose_webrtc 同体，只是把"被动 ws server"换成"主动 ws client"。
+        与 _run_expose_unified 同体，只是把"被动 ws server"换成"主动 ws client"。
         """
         if not _STREAM_AVAILABLE:
             raise RuntimeError("Relay publisher mode requires: pip install holoviewer[stream] (websockets, aiortc, av)")
