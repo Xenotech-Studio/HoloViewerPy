@@ -554,6 +554,8 @@ def _run_expose_server(
         return
     from aiortc.mediastreams import VideoStreamTrack  # type: ignore
 
+    json_mod = __import__("json")
+
     class QueueVideoTrack(VideoStreamTrack):
         kind = "video"
 
@@ -566,6 +568,7 @@ def _run_expose_server(
             super().__init__()
             self._queue = q
             self._stop = stop
+            self._last_bgr = None  # cached frame for replay when queue empty
             # 用 list 包一层做 mutable holder，handler 收到 datachannel("input") 后写入；
             # QueueVideoTrack 每编码一帧时若 holder[0] 非 None 就把 input_ts echo 回去，
             # 浏览器算 now-input_ts 得到 send→display 端到端延迟（≈ motion-to-photon）。
@@ -576,11 +579,13 @@ def _run_expose_server(
             # 比手动 `self._pts += 1` 强：后者只跟"调用次数"挂钩，跟实际 wall clock 脱节，
             # browser jitter buffer 在 source 帧率漂移时会逐渐累积延迟。
             pts, time_base = await self.next_timestamp()
-            while not self._stop.is_set():
-                try:
-                    latest = self._queue.get(timeout=0.5)
-                except Empty:
-                    continue
+            # Try to drain queue for latest frame (non-blocking, no sleep-loop)
+            latest = None
+            try:
+                latest = self._queue.get_nowait()
+            except Empty:
+                pass
+            else:
                 # 排空积压（last-frame-wins），保证编码的永远是最新帧，
                 # 渲染端 ~40fps 而 encoder ~30fps 时不会留旧帧。
                 try:
@@ -588,21 +593,43 @@ def _run_expose_server(
                         latest = self._queue.get_nowait()
                 except Empty:
                     pass
+
+            if latest is not None:
                 frame_bgr, _, frame_input_ts = latest
+                self._last_bgr = frame_bgr.copy()  # cache for replay when queue empty
                 # 通过 DataChannel 回送 frame_meta（同 socket 模式协议）让客户端测延迟。
                 if frame_input_ts is not None and self._meta_channel_holder is not None:
                     ch = self._meta_channel_holder[0]
-                    if ch is not None and getattr(ch, "readyState", "") == "open":
+                    if ch is not None and getattr(ch, 'readyState', '') == 'open':
                         try:
-                            ch.send(__import__("json").dumps({"type": "frame_meta", "input_ts": frame_input_ts}))
+                            ch.send(__import__('json').dumps({'type': 'frame_meta', 'input_ts': frame_input_ts}))
                         except Exception:
                             pass
-                av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
+                av_frame = av.VideoFrame.from_ndarray(frame_bgr, format='bgr24')
                 av_frame.pts = pts
                 av_frame.time_base = time_base
                 return av_frame
-            raise Exception("track stopped")
 
+            # No new frame: replay cached frame, or generate default loading placeholder
+            if self._last_bgr is not None:
+                frame_bgr = self._last_bgr
+            else:
+                try:
+                    import cv2 as _cv2
+                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+                    frame_bgr[:] = (30, 30, 40)
+                    _cv2.putText(frame_bgr, 'LOADING...', (480, 360),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (220, 220, 220), 3, _cv2.LINE_AA)
+                    _cv2.putText(frame_bgr, 'Training data preparation in progress',
+                                 (350, 420), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 160), 2, _cv2.LINE_AA)
+                except Exception:
+                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+                self._last_bgr = frame_bgr
+
+            av_frame = av.VideoFrame.from_ndarray(frame_bgr, format='bgr24')
+            av_frame.pts = pts
+            av_frame.time_base = time_base
+            return av_frame
     async def _serve(
         ws_port: int,
         q: "Queue[FramePacket]",
@@ -767,6 +794,8 @@ def _run_relay_publisher_webrtc(
         return
     from aiortc.mediastreams import VideoStreamTrack  # type: ignore
 
+    json_mod = __import__("json")
+
     class QueueVideoTrack(VideoStreamTrack):
         kind = "video"
 
@@ -779,6 +808,7 @@ def _run_relay_publisher_webrtc(
             super().__init__()
             self._queue = q
             self._stop = stop
+            self._last_bgr = None  # cached frame for replay when queue empty
             # 用 list 包一层做 mutable holder，handler 收到 datachannel("input") 后写入；
             # QueueVideoTrack 每编码一帧时若 holder[0] 非 None 就把 input_ts echo 回去，
             # 浏览器算 now-input_ts 得到 send→display 端到端延迟（≈ motion-to-photon）。
@@ -789,11 +819,13 @@ def _run_relay_publisher_webrtc(
             # 比手动 `self._pts += 1` 强：后者只跟"调用次数"挂钩，跟实际 wall clock 脱节，
             # browser jitter buffer 在 source 帧率漂移时会逐渐累积延迟。
             pts, time_base = await self.next_timestamp()
-            while not self._stop.is_set():
-                try:
-                    latest = self._queue.get(timeout=0.5)
-                except Empty:
-                    continue
+            # Try to drain queue for latest frame (non-blocking, no sleep-loop)
+            latest = None
+            try:
+                latest = self._queue.get_nowait()
+            except Empty:
+                pass
+            else:
                 # 排空积压（last-frame-wins），保证编码的永远是最新帧，
                 # 渲染端 ~40fps 而 encoder ~30fps 时不会留旧帧。
                 try:
@@ -801,34 +833,56 @@ def _run_relay_publisher_webrtc(
                         latest = self._queue.get_nowait()
                 except Empty:
                     pass
+
+            if latest is not None:
                 frame_bgr, _, frame_input_ts = latest
+                self._last_bgr = frame_bgr.copy()  # cache for replay when queue empty
                 # 通过 DataChannel 回送 frame_meta（同 socket 模式协议）让客户端测延迟。
                 if frame_input_ts is not None and self._meta_channel_holder is not None:
                     ch = self._meta_channel_holder[0]
-                    if ch is not None and getattr(ch, "readyState", "") == "open":
+                    if ch is not None and getattr(ch, 'readyState', '') == 'open':
                         try:
-                            ch.send(__import__("json").dumps({"type": "frame_meta", "input_ts": frame_input_ts}))
+                            ch.send(__import__('json').dumps({'type': 'frame_meta', 'input_ts': frame_input_ts}))
                         except Exception:
                             pass
-                av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
+                av_frame = av.VideoFrame.from_ndarray(frame_bgr, format='bgr24')
                 av_frame.pts = pts
                 av_frame.time_base = time_base
                 return av_frame
-            raise Exception("track stopped")
 
-    json_mod = __import__("json")
-    sep = "&" if "?" in signaling_url else "?"
-    url = f"{signaling_url}{sep}room={room_id}&role=publisher"
+            # No new frame: replay cached frame, or generate default loading placeholder
+            if self._last_bgr is not None:
+                frame_bgr = self._last_bgr
+            else:
+                try:
+                    import cv2 as _cv2
+                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+                    frame_bgr[:] = (30, 30, 40)
+                    _cv2.putText(frame_bgr, 'LOADING...', (480, 360),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (220, 220, 220), 3, _cv2.LINE_AA)
+                    _cv2.putText(frame_bgr, 'Training data preparation in progress',
+                                 (350, 420), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 160), 2, _cv2.LINE_AA)
+                except Exception:
+                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+                self._last_bgr = frame_bgr
+
+            av_frame = av.VideoFrame.from_ndarray(frame_bgr, format='bgr24')
+            av_frame.pts = pts
+            av_frame.time_base = time_base
+            return av_frame
+    # Build signaling URL with required query params (room + role + identity)
+    _url = f"{signaling_url}?room={room_id}&role=publisher"
     if identity:
-        url = f"{url}&identity={identity}"
+        from urllib.parse import quote
+        _url += f"&identity={quote(identity, safe='')}"
 
     async def _serve() -> None:
         backoff = 1.0
         while not stop_ev.is_set():
             try:
-                logger.info("Relay publisher: connecting to %s ...", url)
+                logger.info("Relay publisher: connecting to %s ...", _url)
                 async with websockets.connect(  # type: ignore[union-attr]
-                    url, ping_interval=20, ping_timeout=20, close_timeout=2,
+                    _url, ping_interval=20, ping_timeout=20, close_timeout=2,
                 ) as ws:
                     backoff = 1.0
                     await _session(ws)
@@ -968,8 +1022,9 @@ def _run_relay_publisher_webrtc(
                 elif msg_type == "peer_ready":
                     logger.info("Relay publisher: subscriber already in room (joined first)")
                 elif msg_type == "peer_left":
-                    logger.info("Relay publisher: subscriber left, tearing down peer connection")
+                    logger.info("Relay publisher: subscriber left, tearing down and restarting session")
                     await reset_pc()
+                    return  # close WS, let _serve reconnect with fresh room state
                 elif msg_type == "offer" and isinstance(data.get("sdp"), str):
                     try:
                         await accept_offer(data["sdp"])
@@ -1328,6 +1383,7 @@ def _run_expose_server_unified(
             super().__init__()
             self._queue = q
             self._stop = stop
+            self._last_bgr = None  # cached frame for replay when queue empty
             self._meta_channel_holder = meta_channel_holder
 
         async def recv(self) -> Any:
@@ -1353,6 +1409,8 @@ def _run_expose_server_unified(
                 av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
                 av_frame.pts = pts
                 av_frame.time_base = time_base
+                # Cache frame for replay during gaps
+                self._last_bgr = frame_bgr.copy()
                 return av_frame
             raise Exception("track stopped")
 
