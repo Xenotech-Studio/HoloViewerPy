@@ -1388,17 +1388,22 @@ def _run_expose_server_unified(
 
         async def recv(self) -> Any:
             pts, time_base = await self.next_timestamp()
-            while not self._stop.is_set():
-                try:
-                    latest = self._queue.get(timeout=0.5)
-                except Empty:
-                    continue
+            # Non-blocking drain — no sleep-loop, no timeout block
+            latest = None
+            try:
+                latest = self._queue.get_nowait()
+            except Empty:
+                pass
+            else:
                 try:
                     while True:
                         latest = self._queue.get_nowait()
                 except Empty:
                     pass
+
+            if latest is not None:
                 frame_bgr, _, frame_input_ts = latest
+                self._last_bgr = frame_bgr.copy()
                 if frame_input_ts is not None and self._meta_channel_holder is not None:
                     ch = self._meta_channel_holder[0]
                     if ch is not None and getattr(ch, "readyState", "") == "open":
@@ -1409,10 +1414,26 @@ def _run_expose_server_unified(
                 av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
                 av_frame.pts = pts
                 av_frame.time_base = time_base
-                # Cache frame for replay during gaps
-                self._last_bgr = frame_bgr.copy()
                 return av_frame
-            raise Exception("track stopped")
+
+            # No new frame: replay cached, or show loading placeholder
+            if self._last_bgr is not None:
+                frame_bgr = self._last_bgr
+            else:
+                try:
+                    import cv2 as _cv2
+                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+                    frame_bgr[:] = (30, 30, 40)
+                    _cv2.putText(frame_bgr, "LOADING...", (480, 360),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.5, (200, 200, 200), 3)
+                except Exception:
+                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+                    frame_bgr[:] = (30, 30, 40)
+
+            av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
+            av_frame.pts = pts
+            av_frame.time_base = time_base
+            return av_frame
 
     # ── WebRTC handler（提取自 _run_expose_server 内联 handler）───────
     async def _handle_webrtc(websocket: Any, offer_data: dict) -> None:
