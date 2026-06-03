@@ -564,6 +564,7 @@ def _run_expose_server(
             q: "Queue[FramePacket]",
             stop: threading.Event,
             meta_channel_holder: Optional[List[Any]] = None,
+            loading_info: Optional[List[Optional[Dict[str, Any]]]] = None,
         ) -> None:
             super().__init__()
             self._queue = q
@@ -573,6 +574,8 @@ def _run_expose_server(
             # QueueVideoTrack 每编码一帧时若 holder[0] 非 None 就把 input_ts echo 回去，
             # 浏览器算 now-input_ts 得到 send→display 端到端延迟（≈ motion-to-photon）。
             self._meta_channel_holder = meta_channel_holder
+            # 加载进度信息 mutable holder: [{"stage": "Loading images", "current": 14, "total": 22}]
+            self._loading_info = loading_info
 
         async def recv(self) -> Any:
             # next_timestamp() 按 30fps 墙钟节拍生成 pts + 自动 sleep 到合适时刻；
@@ -610,21 +613,28 @@ def _run_expose_server(
                 av_frame.time_base = time_base
                 return av_frame
 
-            # No new frame: replay cached frame, or generate default loading placeholder
-            if self._last_bgr is not None:
-                frame_bgr = self._last_bgr
-            else:
-                try:
-                    import cv2 as _cv2
-                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
-                    frame_bgr[:] = (30, 30, 40)
-                    _cv2.putText(frame_bgr, 'LOADING...', (480, 360),
-                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (220, 220, 220), 3, _cv2.LINE_AA)
-                    _cv2.putText(frame_bgr, 'Training data preparation in progress',
-                                 (350, 420), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 160), 2, _cv2.LINE_AA)
-                except Exception:
-                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
-                self._last_bgr = frame_bgr
+            # No new frame: regenerate animated loading placeholder every frame
+            try:
+                import cv2 as _cv2
+                frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+                frame_bgr[:] = (30, 30, 40)
+                # Animated dots + cycling progress bar (wall-clock driven)
+                phase = (int(time.time() * 3)) % 4
+                dots = "." * (1 + phase) if phase < 3 else "..."
+                pct = (int(time.time() * 100) % 5000) / 50.0  # 0→100% in ~5s
+                _cv2.putText(frame_bgr, f'LOADING{dots}', (490, 330),
+                             _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (220, 220, 220), 3, _cv2.LINE_AA)
+                bar_x, bar_y, bar_w, bar_h = 340, 375, 600, 14
+                _cv2.rectangle(frame_bgr, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (80, 80, 90), 1)
+                fill_w = int(bar_w * pct / 100.0)
+                _cv2.rectangle(frame_bgr, (bar_x + 2, bar_y + 2), (bar_x + fill_w, bar_y + bar_h - 2), (80, 160, 200), -1)
+                _cv2.putText(frame_bgr, f'{pct:.0f}%', (bar_x + bar_w // 2 - 20, bar_y + bar_h + 20),
+                             _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 170, 180), 2, _cv2.LINE_AA)
+                _cv2.putText(frame_bgr, 'Training data preparation in progress',
+                             (390, 435), _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (130, 130, 140), 1, _cv2.LINE_AA)
+            except Exception:
+                frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+            # Don't cache placeholder — always regenerate for animation
 
             av_frame = av.VideoFrame.from_ndarray(frame_bgr, format='bgr24')
             av_frame.pts = pts
@@ -779,8 +789,9 @@ def _run_relay_publisher_webrtc(
     frame_queue: "Queue[FramePacket]",
     stop_ev: threading.Event,
     camera_command_queue: "Queue[CameraCommand]",
-    viewer: "HoloViewer",
+    viewer_ref: List[Optional["HoloViewer"]],
     identity: Optional[str] = None,
+    loading_info: Optional[List[Optional[Dict[str, Any]]]] = None,
 ) -> None:
     """WebRTC publisher 中转模式：主动连中央信令 wss，注册到 room；每当 subscriber 进入即接受
     其 offer 并回 answer，subscriber 退出后等下一个。与 _run_expose_server 报文格式 1:1 兼容，
@@ -804,6 +815,7 @@ def _run_relay_publisher_webrtc(
             q: "Queue[FramePacket]",
             stop: threading.Event,
             meta_channel_holder: Optional[List[Any]] = None,
+            loading_info: Optional[List[Optional[Dict[str, Any]]]] = None,
         ) -> None:
             super().__init__()
             self._queue = q
@@ -813,6 +825,7 @@ def _run_relay_publisher_webrtc(
             # QueueVideoTrack 每编码一帧时若 holder[0] 非 None 就把 input_ts echo 回去，
             # 浏览器算 now-input_ts 得到 send→display 端到端延迟（≈ motion-to-photon）。
             self._meta_channel_holder = meta_channel_holder
+            self._loading_info = loading_info
 
         async def recv(self) -> Any:
             # next_timestamp() 按 30fps 墙钟节拍生成 pts + 自动 sleep 到合适时刻；
@@ -850,7 +863,8 @@ def _run_relay_publisher_webrtc(
                 av_frame.time_base = time_base
                 return av_frame
 
-            # No new frame: replay cached frame, or generate default loading placeholder
+            # No new frame: replay cached last real frame if available,
+            # otherwise regenerate animated loading placeholder.
             if self._last_bgr is not None:
                 frame_bgr = self._last_bgr
             else:
@@ -858,13 +872,42 @@ def _run_relay_publisher_webrtc(
                     import cv2 as _cv2
                     frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
                     frame_bgr[:] = (30, 30, 40)
-                    _cv2.putText(frame_bgr, 'LOADING...', (480, 360),
-                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (220, 220, 220), 3, _cv2.LINE_AA)
-                    _cv2.putText(frame_bgr, 'Training data preparation in progress',
-                                 (350, 420), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 160), 2, _cv2.LINE_AA)
+                    phase = (int(time.time() * 3)) % 4
+                    dots = "." * (1 + phase) if phase < 3 else "..."
+
+                    # Read loading info from caller (loading_status dict: stage, progress, progress_text)
+                    _lbl: Optional[Dict] = None
+                    if self._loading_info is not None:
+                        _lbl = self._loading_info[0]
+
+                    if _lbl and isinstance(_lbl, dict):
+                        stage = _lbl.get("stage", "")
+                        pct_val: Optional[float] = _lbl.get("progress")
+                        pct_text = _lbl.get("progress_text", "")
+
+                        _cv2.putText(frame_bgr, f'{stage}{dots}', (490, 330),
+                                     _cv2.FONT_HERSHEY_SIMPLEX, 1.1, (220, 220, 220), 2, _cv2.LINE_AA)
+                        if pct_val is not None and isinstance(pct_val, (int, float)):
+                            bar_x, bar_y, bar_w, bar_h = 340, 375, 600, 14
+                            _cv2.rectangle(frame_bgr, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (80, 80, 90), 1)
+                            fill_w = max(4, int(bar_w * min(1.0, max(0.0, pct_val))))
+                            _cv2.rectangle(frame_bgr, (bar_x + 2, bar_y + 2), (bar_x + fill_w, bar_y + bar_h - 2), (80, 160, 200), -1)
+                            pct_str = f'{int(pct_val * 100)}%'
+                            if pct_text:
+                                pct_str = f'{pct_str}  ({pct_text})'
+                            _cv2.putText(frame_bgr, pct_str, (bar_x + bar_w // 2 - 60, bar_y + bar_h + 20),
+                                         _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 170, 180), 2, _cv2.LINE_AA)
+                        else:
+                            _cv2.putText(frame_bgr, 'Preparing...', (490, 410),
+                                         _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (130, 130, 140), 1, _cv2.LINE_AA)
+                    else:
+                        _cv2.putText(frame_bgr, f'LOADING{dots}', (490, 330),
+                                     _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (220, 220, 220), 3, _cv2.LINE_AA)
+                        _cv2.putText(frame_bgr, 'Initializing...', (490, 410),
+                                     _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (130, 130, 140), 1, _cv2.LINE_AA)
                 except Exception:
                     frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
-                self._last_bgr = frame_bgr
+                # Don't cache placeholder — always regenerate for animation
 
             av_frame = av.VideoFrame.from_ndarray(frame_bgr, format='bgr24')
             av_frame.pts = pts
@@ -902,12 +945,13 @@ def _run_relay_publisher_webrtc(
 
         def init_remote() -> None:
             nonlocal remote_pos, remote_yaw, remote_pitch
-            if remote_pos is not None:
+            v = viewer_ref[0]
+            if remote_pos is not None or v is None:
                 return
-            pos, forward = viewer.get_initial_pose()
+            pos, forward = v.get_initial_pose()
             pos = pos.astype(np.float64)
             forward = forward / (np.linalg.norm(forward) + 1e-9)
-            remote_yaw, remote_pitch = viewer.axis_system.look_dir_to_angles(forward)
+            remote_yaw, remote_pitch = v.axis_system.look_dir_to_angles(forward)
             remote_pos = pos
 
         async def reset_pc() -> None:
@@ -925,7 +969,7 @@ def _run_relay_publisher_webrtc(
             await reset_pc()
             pc = RTCPeerConnection(_default_rtc_configuration())
             meta_channel_holder: List[Any] = [None]
-            frame_track = QueueVideoTrack(frame_queue, stop_ev, meta_channel_holder)
+            frame_track = QueueVideoTrack(frame_queue, stop_ev, meta_channel_holder, loading_info)
             pc.addTrack(frame_track)
 
             @pc.on("datachannel")
@@ -937,8 +981,11 @@ def _run_relay_publisher_webrtc(
                 @channel.on("open")
                 def on_open() -> None:
                     # DC 建链时反向汇报当前服务端速度乘数，让 UI 上来就和服务端对齐
+                    v = viewer_ref[0]
+                    if v is None:
+                        return
                     try:
-                        cur_mul = viewer.move_speed / viewer._move_speed_base if viewer._move_speed_base else 1.0
+                        cur_mul = v.move_speed / v._move_speed_base if v._move_speed_base else 1.0
                         channel.send(json_mod.dumps({
                             "type": "server_state",
                             "move_speed_mul": cur_mul,
@@ -957,8 +1004,9 @@ def _run_relay_publisher_webrtc(
                         # 独立 config 消息：拖滑块时一次性，直接覆盖 viewer.move_speed
                         if recv_data.get("type") == "config":
                             mul = recv_data.get("move_speed_mul")
-                            if isinstance(mul, (int, float)) and mul > 0:
-                                viewer.move_speed = viewer._move_speed_base * max(0.05, min(20.0, float(mul)))
+                            v = viewer_ref[0]
+                            if v is not None and isinstance(mul, (int, float)) and mul > 0:
+                                v.move_speed = v._move_speed_base * max(0.05, min(20.0, float(mul)))
                             return
                         w_raw = recv_data.get("width")
                         h_raw = recv_data.get("height")
@@ -966,17 +1014,24 @@ def _run_relay_publisher_webrtc(
                             # libx264 + yuv420p 要求宽高双数；浏览器全屏时常给奇数高度
                             w = max(64, min(4096, int(w_raw))) & ~1
                             h = max(64, min(4096, int(h_raw))) & ~1
-                            viewer._remote_render_size = [w, h]
+                            v = viewer_ref[0]
+                            if v is not None:
+                                v._remote_render_size = [w, h]
                         init_remote()
-                        pos, yaw, pitch = viewer._apply_input(
-                            remote_pos, remote_yaw, remote_pitch, recv_data
-                        )
-                        remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
-                        ts = recv_data.get("__input_ts")
-                        try:
-                            camera_command_queue.put_nowait((pos, yaw, pitch, ts if isinstance(ts, (int, float)) else None))
-                        except Exception:  # noqa: BLE001
-                            pass
+                        v = viewer_ref[0]
+                        if v is not None and remote_pos is not None:
+                            pos, yaw, pitch = v._apply_input(
+                                remote_pos, remote_yaw, remote_pitch, recv_data
+                            )
+                            remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                        else:
+                            pos = yaw = pitch = None
+                        if pos is not None:
+                            ts = recv_data.get("__input_ts")
+                            try:
+                                camera_command_queue.put_nowait((pos, yaw, pitch, ts if isinstance(ts, (int, float)) else None))
+                            except Exception:  # noqa: BLE001
+                                pass
                     except Exception:  # noqa: BLE001
                         pass
 
@@ -1348,8 +1403,9 @@ def _run_expose_server_unified(
     frame_queue: "Queue[FramePacket]",
     stop_ev: threading.Event,
     camera_command_queue: "Queue[CameraCommand]",
-    viewer: "HoloViewer",
+    viewer_ref: List[Optional["HoloViewer"]],
     no_compress: bool = False,
+    loading_info: Optional[List[Optional[dict]]] = None,
 ) -> None:
     """Unified WebSocket server: 同一端口同时服务 WebRTC 和 socket (H.264) 两种协议。
 
@@ -1379,12 +1435,14 @@ def _run_expose_server_unified(
             q: "Queue[FramePacket]",
             stop: threading.Event,
             meta_channel_holder: Optional[List[Any]] = None,
+            loading_info: Optional[List[Optional[dict]]] = None,
         ) -> None:
             super().__init__()
             self._queue = q
             self._stop = stop
             self._last_bgr = None  # cached frame for replay when queue empty
             self._meta_channel_holder = meta_channel_holder
+            self._loading_info = loading_info
 
         async def recv(self) -> Any:
             pts, time_base = await self.next_timestamp()
@@ -1416,19 +1474,46 @@ def _run_expose_server_unified(
                 av_frame.time_base = time_base
                 return av_frame
 
-            # No new frame: replay cached, or show loading placeholder
-            if self._last_bgr is not None:
-                frame_bgr = self._last_bgr
-            else:
-                try:
-                    import cv2 as _cv2
-                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
-                    frame_bgr[:] = (30, 30, 40)
-                    _cv2.putText(frame_bgr, "LOADING...", (480, 360),
-                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.5, (200, 200, 200), 3)
-                except Exception:
-                    frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
-                    frame_bgr[:] = (30, 30, 40)
+            # No new frame: regenerate animated loading placeholder every frame
+            try:
+                import cv2 as _cv2
+                frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+                frame_bgr[:] = (30, 30, 40)
+                phase = (int(time.time() * 3)) % 4
+                dots = "." * (1 + phase) if phase < 3 else "..."
+
+                # Read loading status from shared holder (pushed by training pipeline)
+                status = None
+                if self._loading_info is not None:
+                    status = self._loading_info[0]
+
+                if status is not None:
+                    stage = status.get("stage", "Loading")
+                    progress = status.get("progress")  # 0.0-1.0, or None if unknown
+                    pct_text = status.get("progress_text", "")
+                    _cv2.putText(frame_bgr, f'{stage}{dots}', (490, 330),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.1, (220, 220, 220), 2, _cv2.LINE_AA)
+                    if progress is not None:
+                        bar_x, bar_y, bar_w, bar_h = 340, 375, 600, 14
+                        _cv2.rectangle(frame_bgr, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (80, 80, 90), 1)
+                        fill_w = max(4, int(bar_w * progress))
+                        _cv2.rectangle(frame_bgr, (bar_x + 2, bar_y + 2), (bar_x + fill_w, bar_y + bar_h - 2), (80, 160, 200), -1)
+                        pct_str = f'{int(progress * 100)}%'
+                        if pct_text:
+                            pct_str = f'{pct_str}  ({pct_text})'
+                        _cv2.putText(frame_bgr, pct_str, (bar_x + bar_w // 2 - 60, bar_y + bar_h + 20),
+                                     _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 170, 180), 2, _cv2.LINE_AA)
+                    else:
+                        _cv2.putText(frame_bgr, 'Preparing...', (490, 410),
+                                     _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (130, 130, 140), 1, _cv2.LINE_AA)
+                else:
+                    _cv2.putText(frame_bgr, f'LOADING{dots}', (490, 330),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (220, 220, 220), 3, _cv2.LINE_AA)
+                    _cv2.putText(frame_bgr, 'Initializing...', (490, 410),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (130, 130, 140), 1, _cv2.LINE_AA)
+            except Exception:
+                frame_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
+            # Don't cache placeholder — always regenerate for animation
 
             av_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
             av_frame.pts = pts
@@ -1446,18 +1531,19 @@ def _run_expose_server_unified(
 
         def init_remote() -> None:
             nonlocal remote_pos, remote_yaw, remote_pitch
-            if remote_pos is not None:
+            v = viewer_ref[0]
+            if remote_pos is not None or v is None:
                 return
-            pos, forward = viewer.get_initial_pose()
+            pos, forward = v.get_initial_pose()
             pos = pos.astype(np.float64)
             forward = forward / (np.linalg.norm(forward) + 1e-9)
-            remote_yaw, remote_pitch = viewer.axis_system.look_dir_to_angles(forward)
+            remote_yaw, remote_pitch = v.axis_system.look_dir_to_angles(forward)
             remote_pos = pos
 
         try:
             pc = RTCPeerConnection(_default_rtc_configuration())
             meta_channel_holder: List[Any] = [None]
-            frame_track = QueueVideoTrack(frame_queue, stop_ev, meta_channel_holder)
+            frame_track = QueueVideoTrack(frame_queue, stop_ev, meta_channel_holder, loading_info)
             pc.addTrack(frame_track)
 
             @pc.on("datachannel")
@@ -1468,11 +1554,13 @@ def _run_expose_server_unified(
                     @channel.on("open")
                     def on_open() -> None:
                         try:
-                            cur_mul = viewer.move_speed / viewer._move_speed_base if viewer._move_speed_base else 1.0
-                            channel.send(__import__("json").dumps({
-                                "type": "server_state",
-                                "move_speed_mul": cur_mul,
-                            }))
+                            v = viewer_ref[0]
+                            if v is not None:
+                                cur_mul = v.move_speed / v._move_speed_base if v._move_speed_base else 1.0
+                                channel.send(__import__("json").dumps({
+                                    "type": "server_state",
+                                    "move_speed_mul": cur_mul,
+                                }))
                         except Exception:
                             pass
 
@@ -1482,22 +1570,29 @@ def _run_expose_server_unified(
                         try:
                             recv_data = __import__("json").loads(message) if isinstance(message, str) else __import__("json").loads(message.decode("utf-8"))
                             if recv_data.get("type") == "config":
-                                mul = recv_data.get("move_speed_mul")
-                                if isinstance(mul, (int, float)) and mul > 0:
-                                    viewer.move_speed = viewer._move_speed_base * max(0.05, min(20.0, float(mul)))
+                                v = viewer_ref[0]
+                                if v is not None:
+                                    mul = recv_data.get("move_speed_mul")
+                                    if isinstance(mul, (int, float)) and mul > 0:
+                                        v.move_speed = v._move_speed_base * max(0.05, min(20.0, float(mul)))
                                 return
-                            w_raw, h_raw = recv_data.get("width"), recv_data.get("height")
-                            if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
-                                w = max(64, min(4096, int(w_raw))) & ~1
-                                h = max(64, min(4096, int(h_raw))) & ~1
-                                viewer._remote_render_size = [w, h]
-                                logger.info("Viewport resize from client: %dx%d", w, h)
-                            init_remote()
-                            pos, yaw, pitch = viewer._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
-                            remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                            v = viewer_ref[0]
+                            if v is not None:
+                                w_raw, h_raw = recv_data.get("width"), recv_data.get("height")
+                                if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
+                                    w = max(64, min(4096, int(w_raw))) & ~1
+                                    h = max(64, min(4096, int(h_raw))) & ~1
+                                    v._remote_render_size = [w, h]
+                                    logger.info("Viewport resize from client: %dx%d", w, h)
+                                init_remote()
+                                pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
+                                remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
                             ts = recv_data.get("__input_ts")
                             try:
-                                camera_command_queue.put_nowait((pos, yaw, pitch, ts if isinstance(ts, (int, float)) else None))
+                                camera_command_queue.put_nowait((pos if remote_pos is not None else None,
+                                                                 yaw if remote_yaw is not None else None,
+                                                                 pitch if remote_pitch is not None else None,
+                                                                 ts if isinstance(ts, (int, float)) else None))
                             except Exception:
                                 pass
                         except Exception:
@@ -1556,12 +1651,13 @@ def _run_expose_server_unified(
 
         def init_remote() -> None:
             nonlocal remote_pos, remote_yaw, remote_pitch
-            if remote_pos is not None:
+            v = viewer_ref[0]
+            if remote_pos is not None or v is None:
                 return
-            pos, forward = viewer.get_initial_pose()
+            pos, forward = v.get_initial_pose()
             pos = pos.astype(np.float64)
             forward = forward / (np.linalg.norm(forward) + 1e-9)
-            remote_yaw, remote_pitch = viewer.axis_system.look_dir_to_angles(forward)
+            remote_yaw, remote_pitch = v.axis_system.look_dir_to_angles(forward)
             remote_pos = pos
 
         try:
@@ -1728,29 +1824,37 @@ def _run_expose_server_unified(
                                     w, h = int(w), int(h)
                                     w = max(64, min(4096, w))
                                     h = max(64, min(4096, h))
-                                    viewer.width, viewer.height = w, h
-                                    logger.info("Viewport resize from client: %dx%d", w, h)
+                                    v = viewer_ref[0]
+                                    if v is not None:
+                                        v.width, v.height = w, h
+                                        logger.info("Viewport resize from client: %dx%d", w, h)
                                 continue
                             w_raw, h_raw = recv_data.get("width"), recv_data.get("height")
                             if isinstance(w_raw, (int, float)) and isinstance(h_raw, (int, float)):
                                 w, h = max(64, min(4096, int(w_raw))), max(64, min(4096, int(h_raw)))
-                                if (viewer.width, viewer.height) != (w, h):
-                                    viewer.width, viewer.height = w, h
+                                v = viewer_ref[0]
+                                if v is not None and (v.width, v.height) != (w, h):
+                                    v.width, v.height = w, h
                                     logger.info("Viewport resize from client: %dx%d", w, h)
                             init_remote()
-                            pos, yaw, pitch = viewer._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
-                            remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
-                            input_ts_raw = recv_data.get("__input_ts")
-                            input_ts = float(input_ts_raw) if isinstance(input_ts_raw, (int, float)) else None
-                            try:
-                                while True:
-                                    camera_command_queue.get_nowait()
-                            except Empty:
-                                pass
-                            try:
-                                camera_command_queue.put_nowait((pos, yaw, pitch, input_ts))
-                            except Exception:
-                                pass
+                            v = viewer_ref[0]
+                            if v is not None and remote_pos is not None:
+                                pos, yaw, pitch = v._apply_input(remote_pos, remote_yaw, remote_pitch, recv_data)
+                                remote_pos, remote_yaw, remote_pitch = pos, yaw, pitch
+                            else:
+                                pos = yaw = pitch = None
+                            if pos is not None:
+                                input_ts_raw = recv_data.get("__input_ts")
+                                input_ts = float(input_ts_raw) if isinstance(input_ts_raw, (int, float)) else None
+                                try:
+                                    while True:
+                                        camera_command_queue.get_nowait()
+                                except Empty:
+                                    pass
+                                try:
+                                    camera_command_queue.put_nowait((pos, yaw, pitch, input_ts))
+                                except Exception:
+                                    pass
                     except asyncio.TimeoutError:
                         continue
                     except Exception:
@@ -2666,7 +2770,7 @@ class HoloViewer(ABC):
         # 1) Unified direct: 同一端口同时接受 WebRTC 和 socket (H.264) 客户端
         server_thread = threading.Thread(
             target=_run_expose_server_unified,
-            args=(port, frame_queue, stop_ev, camera_command_queue, self, no_compress),
+            args=(port, frame_queue, stop_ev, camera_command_queue, [self], no_compress),
             daemon=True,
         )
         server_thread.start()
@@ -2682,7 +2786,7 @@ class HoloViewer(ABC):
             relay_queue: "Queue[FramePacket]" = Queue(maxsize=2)
             relay_thread = threading.Thread(
                 target=_run_relay_publisher_webrtc,
-                args=(relay_url, room_id, relay_queue, stop_ev, camera_command_queue, self),
+                args=(relay_url, room_id, relay_queue, stop_ev, camera_command_queue, [self]),
                 kwargs={"identity": identity},
                 daemon=True,
             )
