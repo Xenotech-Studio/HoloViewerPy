@@ -946,13 +946,23 @@ def _run_relay_publisher_webrtc(
         def init_remote() -> None:
             nonlocal remote_pos, remote_yaw, remote_pitch
             v = viewer_ref[0]
-            if remote_pos is not None or v is None:
+            if v is None:
+                return
+            # Re-initialize if the viewer flagged a new desired initial pose
+            # (e.g. set after the browser connected early, before camera_config).
+            _dirty = getattr(v, "_initial_pose_dirty", False)
+            if remote_pos is not None and not _dirty:
                 return
             pos, forward = v.get_initial_pose()
             pos = pos.astype(np.float64)
             forward = forward / (np.linalg.norm(forward) + 1e-9)
             remote_yaw, remote_pitch = v.axis_system.look_dir_to_angles(forward)
             remote_pos = pos
+            if _dirty:
+                try:
+                    v._initial_pose_dirty = False
+                except Exception:
+                    pass
 
         async def reset_pc() -> None:
             nonlocal pc, frame_track
@@ -1532,13 +1542,23 @@ def _run_expose_server_unified(
         def init_remote() -> None:
             nonlocal remote_pos, remote_yaw, remote_pitch
             v = viewer_ref[0]
-            if remote_pos is not None or v is None:
+            if v is None:
+                return
+            # Re-initialize if the viewer flagged a new desired initial pose
+            # (e.g. set after the browser connected early, before camera_config).
+            _dirty = getattr(v, "_initial_pose_dirty", False)
+            if remote_pos is not None and not _dirty:
                 return
             pos, forward = v.get_initial_pose()
             pos = pos.astype(np.float64)
             forward = forward / (np.linalg.norm(forward) + 1e-9)
             remote_yaw, remote_pitch = v.axis_system.look_dir_to_angles(forward)
             remote_pos = pos
+            if _dirty:
+                try:
+                    v._initial_pose_dirty = False
+                except Exception:
+                    pass
 
         try:
             pc = RTCPeerConnection(_default_rtc_configuration())
@@ -1652,13 +1672,23 @@ def _run_expose_server_unified(
         def init_remote() -> None:
             nonlocal remote_pos, remote_yaw, remote_pitch
             v = viewer_ref[0]
-            if remote_pos is not None or v is None:
+            if v is None:
+                return
+            # Re-initialize if the viewer flagged a new desired initial pose
+            # (e.g. set after the browser connected early, before camera_config).
+            _dirty = getattr(v, "_initial_pose_dirty", False)
+            if remote_pos is not None and not _dirty:
                 return
             pos, forward = v.get_initial_pose()
             pos = pos.astype(np.float64)
             forward = forward / (np.linalg.norm(forward) + 1e-9)
             remote_yaw, remote_pitch = v.axis_system.look_dir_to_angles(forward)
             remote_pos = pos
+            if _dirty:
+                try:
+                    v._initial_pose_dirty = False
+                except Exception:
+                    pass
 
         try:
             # 先读首条消息（unified dispatcher 已 peek 过，这里拿到 pending_first）
