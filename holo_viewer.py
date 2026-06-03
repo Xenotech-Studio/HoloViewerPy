@@ -26,7 +26,9 @@ def _ensure_console_logging() -> None:
     logger.setLevel(logging.INFO)
 
 import numpy as np
-import torch
+# torch is imported lazily (only inside to_uint8_bgr / build_camera) so the
+# streaming sidecar — which never renders — starts ~2s faster and doesn't load
+# torch's big .so files while the trainer is hammering the disk during loading.
 
 FramePacket = Tuple[np.ndarray, float, Optional[float]]
 CameraCommand = Tuple[np.ndarray, float, float, Optional[float]]
@@ -472,7 +474,8 @@ def wrap_time(t: float, tmin: float, tmax: float) -> float:
     return tmin + ((t - tmin) % width)
 
 
-def to_uint8_bgr(image_tensor: torch.Tensor) -> np.ndarray:
+def to_uint8_bgr(image_tensor: "torch.Tensor") -> np.ndarray:
+    import torch
     img = torch.clamp(image_tensor, 0.0, 1.0).detach().cpu().numpy()
     img = (img * 255.0).astype(np.uint8)
     img = np.transpose(img, (1, 2, 0))
@@ -3547,7 +3550,7 @@ class HoloViewer(ABC):
     def draw_world_axes(
         self,
         img_bgr: np.ndarray,
-        full: torch.Tensor,
+        full: "torch.Tensor",
         axis_len: float = 1.0,
     ) -> None:
         origin = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
@@ -3671,18 +3674,19 @@ class HoloViewer(ABC):
         znear: float,
         zfar: float,
         sim_time: float,
-    ) -> Tuple[object, torch.Tensor]:
+    ) -> "Tuple[object, torch.Tensor]":
         """Default: return (cam_dict, full_tensor) with view/proj/full/width/height. Override if you need custom cam data for render_frame or axes."""
+        import torch
         full = (proj @ view).astype(np.float32)
         cam = {"view": view, "proj": proj, "full": full, "width": self.width, "height": self.height}
         return cam, torch.from_numpy(full)
 
     @abstractmethod
-    def render_frame(self, cam: object, sim_time: float) -> torch.Tensor:
+    def render_frame(self, cam: object, sim_time: float) -> "torch.Tensor":
         ...
 
     def project_points_ndc(
-        self, points_ws: np.ndarray, full: torch.Tensor
+        self, points_ws: np.ndarray, full: "torch.Tensor"
     ) -> np.ndarray:
         """World-space points to NDC (e.g. for axes/overlays). Override if you need a different NDC convention."""
         fn = full.cpu().numpy()
