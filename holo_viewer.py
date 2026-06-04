@@ -573,6 +573,7 @@ def _run_expose_server(
             self._queue = q
             self._stop = stop
             self._last_bgr = None  # cached frame for replay when queue empty
+            self._last_new_ts = 0.0  # wall-clock of last NEW frame (stall/LOCKED detection)
             # 用 list 包一层做 mutable holder，handler 收到 datachannel("input") 后写入；
             # QueueVideoTrack 每编码一帧时若 holder[0] 非 None 就把 input_ts echo 回去，
             # 浏览器算 now-input_ts 得到 send→display 端到端延迟（≈ motion-to-photon）。
@@ -603,6 +604,7 @@ def _run_expose_server(
             if latest is not None:
                 frame_bgr, _, frame_input_ts = latest
                 self._last_bgr = frame_bgr.copy()  # cache for replay when queue empty
+                self._last_new_ts = time.time()
                 # 通过 DataChannel 回送 frame_meta（同 socket 模式协议）让客户端测延迟。
                 if frame_input_ts is not None and self._meta_channel_holder is not None:
                     ch = self._meta_channel_holder[0]
@@ -786,6 +788,42 @@ def _run_expose_server(
         logger.info("WebSocket server stopped")
 
 
+_LOCKED_STALL_S = 0.5  # replay freeze longer than this -> show the LOCKED banner
+
+
+def _draw_locked_overlay(bgr, secs):
+    """Overlay a 'LOCKED' banner onto a frozen frame.
+
+    When the producer stops pushing new frames for a while (the trainer is busy
+    in a blocking section — densify/prune at every densification interval, or a
+    checkpoint save), the video track replays the last real frame. This stamps a
+    centered LOCKED banner on a COPY of that frame (the cache must stay clean) so
+    a subscriber sees the stream is alive but paused, not laggy or hung. Animated
+    dots + an elapsed counter make it clearly live."""
+    try:
+        import cv2 as _cv2
+    except Exception:
+        return bgr
+    img = bgr.copy()
+    h, w = img.shape[:2]
+    bw, bh = 380, 96
+    x0, y0 = (w - bw) // 2, (h - bh) // 2
+    ov = img.copy()
+    _cv2.rectangle(ov, (x0, y0), (x0 + bw, y0 + bh), (0, 0, 0), -1)
+    _cv2.addWeighted(ov, 0.55, img, 0.45, 0, img)
+    _cv2.rectangle(img, (x0, y0), (x0 + bw, y0 + bh), (45, 45, 55), 1)
+    title = "LOCKED"
+    (tw, th), _ = _cv2.getTextSize(title, _cv2.FONT_HERSHEY_SIMPLEX, 1.1, 3)
+    _cv2.putText(img, title, (x0 + (bw - tw) // 2, y0 + 46),
+                 _cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3, _cv2.LINE_AA)
+    dots = "." * (int(secs * 2) % 4)
+    sub = f"doing saving or other stuff{dots}  ({secs:.0f}s)"
+    (sw, _sh), _ = _cv2.getTextSize(sub, _cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    _cv2.putText(img, sub, (x0 + (bw - sw) // 2, y0 + 76),
+                 _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (185, 185, 195), 1, _cv2.LINE_AA)
+    return img
+
+
 def _run_relay_publisher_webrtc(
     signaling_url: str,
     room_id: str,
@@ -824,6 +862,7 @@ def _run_relay_publisher_webrtc(
             self._queue = q
             self._stop = stop
             self._last_bgr = None  # cached frame for replay when queue empty
+            self._last_new_ts = 0.0  # wall-clock of last NEW frame (stall/LOCKED detection)
             # 用 list 包一层做 mutable holder，handler 收到 datachannel("input") 后写入；
             # QueueVideoTrack 每编码一帧时若 holder[0] 非 None 就把 input_ts echo 回去，
             # 浏览器算 now-input_ts 得到 send→display 端到端延迟（≈ motion-to-photon）。
@@ -853,6 +892,7 @@ def _run_relay_publisher_webrtc(
             if latest is not None:
                 frame_bgr, _, frame_input_ts = latest
                 self._last_bgr = frame_bgr.copy()  # cache for replay when queue empty
+                self._last_new_ts = time.time()
                 # 通过 DataChannel 回送 frame_meta（同 socket 模式协议）让客户端测延迟。
                 if frame_input_ts is not None and self._meta_channel_holder is not None:
                     ch = self._meta_channel_holder[0]
@@ -870,6 +910,12 @@ def _run_relay_publisher_webrtc(
             # otherwise regenerate animated loading placeholder.
             if self._last_bgr is not None:
                 frame_bgr = self._last_bgr
+                # Freeze longer than normal jitter -> trainer is in a blocking
+                # section (densify/prune at every interval, or a checkpoint save);
+                # stamp a LOCKED banner on the replayed frame so the viewer knows.
+                _stall = time.time() - self._last_new_ts
+                if _stall > _LOCKED_STALL_S:
+                    frame_bgr = _draw_locked_overlay(frame_bgr, _stall)
             else:
                 try:
                     import cv2 as _cv2
@@ -1454,6 +1500,7 @@ def _run_expose_server_unified(
             self._queue = q
             self._stop = stop
             self._last_bgr = None  # cached frame for replay when queue empty
+            self._last_new_ts = 0.0  # wall-clock of last NEW frame (stall/LOCKED detection)
             self._meta_channel_holder = meta_channel_holder
             self._loading_info = loading_info
 
